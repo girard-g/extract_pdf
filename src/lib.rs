@@ -921,9 +921,15 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
     match to_unicode {
         Some(&Object::Stream(ref stream)) => {
             let contents = get_contents(stream);
-            dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
+            dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap_or_else(|_| "<binary>".to_string()));
 
-            let cmap = adobe_cmap_parser::get_unicode_map(&contents).unwrap();
+            let cmap = match adobe_cmap_parser::get_unicode_map(&contents) {
+                Ok(cmap) => cmap,
+                Err(e) => {
+                    warn!("Failed to parse ToUnicode CMap: {:?}. Returning empty unicode map.", e);
+                    return None;
+                }
+            };
             let mut unicode = HashMap::new();
             // "It must use the beginbfchar, endbfchar, beginbfrange, and endbfrange operators to
             // define the mapping from character codes to Unicode character sequences expressed in
@@ -931,7 +937,10 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
             for (&k, v) in cmap.iter() {
                 let mut be: Vec<u16> = Vec::new();
                 let mut i = 0;
-                assert!(v.len() % 2 == 0);
+                if v.len() % 2 != 0 {
+                    warn!("Invalid UTF-16BE data for char code {}: odd number of bytes ({}), skipping", k, v.len());
+                    continue;
+                }
                 while i < v.len() {
                     be.push(((v[i] as u16) << 8) | v[i+1] as u16);
                     i += 2;
@@ -944,7 +953,13 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
                     }
                     _ => {}
                 }
-                let s = String::from_utf16(&be).unwrap();
+                let s = match String::from_utf16(&be) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        debug!("Invalid UTF-16 sequence for char code {}, skipping", k);
+                        continue;
+                    }
+                };
 
                 unicode.insert(k, s);
             }
@@ -959,7 +974,9 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
                 todo!("unsupported ToUnicode name: {:?}", name);
             }
         }
-        _ => { panic!("unsupported cmap {:?}", to_unicode)}
+        _ => {
+            warn!("Unsupported ToUnicode object type: {:?}, ignoring", to_unicode);
+        }
     }
     unicode_map
 }
@@ -980,15 +997,31 @@ impl<'a> PdfCIDFont<'a> {
                 if name == "Identity-H" || name == "Identity-V" {
                     ByteMapping { codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }], cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]}
                 } else {
-                    panic!("unsupported encoding {}", name);
+                    warn!("Unsupported encoding name: {}, falling back to Identity-H", name);
+                    ByteMapping { codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }], cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]}
                 }
             }
             &Object::Stream(ref stream) => {
                 let contents = get_contents(stream);
-                dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
-                adobe_cmap_parser::get_byte_mapping(&contents).unwrap()
+                dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap_or_else(|_| "<binary>".to_string()));
+                match adobe_cmap_parser::get_byte_mapping(&contents) {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        warn!("Failed to parse CID encoding CMap: {:?}. Falling back to Identity-H", e);
+                        ByteMapping {
+                            codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }],
+                            cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]
+                        }
+                    }
+                }
             }
-            _ => { panic!("unsupported encoding {:?}", encoding)}
+            _ => {
+                warn!("Unsupported encoding type: {:?}, falling back to Identity-H", encoding);
+                ByteMapping {
+                    codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }],
+                    cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]
+                }
+            }
         };
 
         // Sometimes a Type0 font might refer to the same underlying data as regular font. In this case we may be able to extract some encoding
