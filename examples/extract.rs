@@ -33,7 +33,8 @@ fn main() {
         "txt" => Box::new(PlainTextOutput::new(&mut output_file as &mut dyn std::io::Write)),
         "html" => Box::new(HTMLOutput::new(&mut output_file)),
         "svg" => Box::new(SVGOutput::new(&mut output_file)),
-        _ => panic!(),
+        "md" | "markdown" => Box::new(MarkdownOutput::new(&mut output_file as &mut dyn std::io::Write)),
+        _ => panic!("Unknown output format: {}. Supported formats: txt, html, svg, md, markdown", output_kind),
     };
 
     if doc.is_encrypted() {

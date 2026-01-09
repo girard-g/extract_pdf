@@ -923,10 +923,16 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
             let contents = get_contents(stream);
             dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap_or_else(|_| "<binary>".to_string()));
 
-            let cmap = match adobe_cmap_parser::get_unicode_map(&contents) {
-                Ok(cmap) => cmap,
-                Err(e) => {
+            let cmap = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                adobe_cmap_parser::get_unicode_map(&contents)
+            })) {
+                Ok(Ok(cmap)) => cmap,
+                Ok(Err(e)) => {
                     warn!("Failed to parse ToUnicode CMap: {:?}. Returning empty unicode map.", e);
+                    return None;
+                }
+                Err(panic_err) => {
+                    warn!("CMap parser panicked while parsing ToUnicode: {:?}. Returning empty unicode map.", panic_err);
                     return None;
                 }
             };
@@ -1004,10 +1010,19 @@ impl<'a> PdfCIDFont<'a> {
             &Object::Stream(ref stream) => {
                 let contents = get_contents(stream);
                 dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap_or_else(|_| "<binary>".to_string()));
-                match adobe_cmap_parser::get_byte_mapping(&contents) {
-                    Ok(mapping) => mapping,
-                    Err(e) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    adobe_cmap_parser::get_byte_mapping(&contents)
+                })) {
+                    Ok(Ok(mapping)) => mapping,
+                    Ok(Err(e)) => {
                         warn!("Failed to parse CID encoding CMap: {:?}. Falling back to Identity-H", e);
+                        ByteMapping {
+                            codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }],
+                            cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]
+                        }
+                    }
+                    Err(panic_err) => {
+                        warn!("CMap parser panicked while parsing CID encoding: {:?}. Falling back to Identity-H", panic_err);
                         ByteMapping {
                             codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }],
                             cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]
@@ -1739,7 +1754,8 @@ impl<'a> Processor<'a> {
                 "Tf" => {
                     let fonts: &Dictionary = get(&doc, resources, b"Font");
                     let name = operation.operands[0].as_name().unwrap();
-                    let font = font_table.entry(name.to_owned()).or_insert_with(|| make_font(doc, get::<&Dictionary>(doc, fonts, name))).clone();
+                    let font_dict: &Dictionary = get(doc, fonts, name);
+                    let font = font_table.entry(name.to_owned()).or_insert_with(|| make_font(doc, font_dict)).clone();
                     {
                         /*let file = font.get_descriptor().and_then(|desc| desc.get_file());
                     if let Some(file) = file {
@@ -1753,6 +1769,10 @@ impl<'a> Processor<'a> {
 
                     gs.ts.font_size = as_num(&operation.operands[1]);
                     dlog!("font {} size: {} {:?}", pdf_to_utf8(name), gs.ts.font_size, operation);
+
+                    // Notify output device of font change (for MarkdownOutput)
+                    let base_name = get_name_string(doc, font_dict, b"BaseFont");
+                    output.set_font(&base_name)?;
                 }
                 "Ts" => {
                     gs.ts.rise = as_num(&operation.operands[0]);
@@ -1915,6 +1935,11 @@ pub trait OutputDev {
     fn end_line(&mut self)-> Result<(), OutputError>;
     fn stroke(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
     fn fill(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
+
+    /// Optional hook for font changes (default no-op for backwards compatibility)
+    fn set_font(&mut self, _font_name: &str) -> Result<(), OutputError> {
+        Ok(())
+    }
 }
 
 
@@ -2229,6 +2254,2493 @@ impl<W: ConvertToFmt> OutputDev for PlainTextOutput<W> {
     }
 }
 
+// ==================== Markdown Output Data Structures ====================
+
+/// Font family classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    /// Serif fonts (Times, Georgia, etc.)
+    Serif,
+    /// Sans-serif fonts (Helvetica, Arial, etc.)
+    SansSerif,
+    /// Monospace fonts (Courier, Consolas, etc.)
+    Monospace,
+    /// Symbol fonts (Symbol, ZapfDingbats)
+    Symbol,
+    /// Unknown or unclassified fonts
+    Unknown,
+}
+
+/// Font style information extracted from font name patterns
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FontStyle {
+    /// Is this a bold font? (e.g., "Times-Bold", "Helvetica-Bold")
+    pub is_bold: bool,
+
+    /// Is this an italic font? (e.g., "Times-Italic", "Courier-Oblique")
+    pub is_italic: bool,
+
+    /// Is this a monospace font? (e.g., "Courier", "Consolas", "Menlo")
+    pub is_monospace: bool,
+
+    /// Font family (normalized)
+    pub family: FontFamily,
+}
+
+impl FontStyle {
+    /// Parse font style from BaseFont name
+    fn from_font_name(name: &str) -> Self {
+        let lower = name.to_lowercase();
+
+        // Detect bold
+        let is_bold = lower.contains("bold")
+            || lower.contains("-b")
+            || lower.contains(",b")
+            || lower.contains("heavy")
+            || lower.contains("black");
+
+        // Detect italic
+        let is_italic = lower.contains("italic")
+            || lower.contains("oblique")
+            || lower.contains("-i")
+            || lower.contains(",i");
+
+        // Detect monospace
+        let is_monospace = lower.contains("courier")
+            || lower.contains("mono")
+            || lower.contains("consolas")
+            || lower.contains("menlo")
+            || lower.contains("inconsolata")
+            || lower.contains("dejavu sans mono")
+            || lower.contains("source code")
+            || lower.contains("ubuntu mono");
+
+        // Determine font family
+        let family = if is_monospace {
+            FontFamily::Monospace
+        } else if lower.contains("times")
+            || lower.contains("georgia")
+            || lower.contains("garamond")
+            || lower.contains("baskerville") {
+            FontFamily::Serif
+        } else if lower.contains("helvetica")
+            || lower.contains("arial")
+            || lower.contains("calibri")
+            || lower.contains("verdana") {
+            FontFamily::SansSerif
+        } else if lower.contains("symbol")
+            || lower.contains("zapf")
+            || lower.contains("dingbat") {
+            FontFamily::Symbol
+        } else {
+            FontFamily::Unknown
+        };
+
+        Self { is_bold, is_italic, is_monospace, family }
+    }
+}
+
+impl Default for FontStyle {
+    fn default() -> Self {
+        Self {
+            is_bold: false,
+            is_italic: false,
+            is_monospace: false,
+            family: FontFamily::Unknown,
+        }
+    }
+}
+
+/// A run of text with consistent formatting
+#[derive(Debug, Clone)]
+pub struct TextRun {
+    /// The actual text content
+    pub text: String,
+
+    /// Font size in points (transformed)
+    pub font_size: f64,
+
+    /// Font metadata extracted from BaseFont name
+    pub font_style: FontStyle,
+
+    /// X coordinate (page-relative, post-transform)
+    pub x: f64,
+
+    /// Y coordinate (page-relative, post-transform)
+    pub y: f64,
+
+    /// Width of the text run
+    pub width: f64,
+
+    /// Character index where this run starts (for debugging)
+    pub char_index: usize,
+}
+
+/// A line of text composed of one or more text runs
+#[derive(Debug, Clone)]
+pub struct TextLine {
+    /// All text runs in this line (left-to-right order)
+    pub runs: Vec<TextRun>,
+
+    /// Average Y coordinate of the line
+    pub y: f64,
+
+    /// Leftmost X coordinate (indentation)
+    pub x_start: f64,
+
+    /// Average font size for the line
+    pub avg_font_size: f64,
+
+    /// Dominant font style for the line
+    pub dominant_style: FontStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulletType {
+    Unordered,  // •, -, *, ◦
+    Ordered,    // 1., a., i., etc.
+}
+
+/// A row in a table
+#[derive(Debug, Clone)]
+struct TableRow {
+    cells: Vec<String>,
+    y: f64,
+}
+
+/// A logical block of content (paragraph, heading, list item, code block, table)
+#[derive(Debug, Clone)]
+enum Block {
+    Heading {
+        level: u8,        // 1-6
+        text: String,
+    },
+    Paragraph {
+        lines: Vec<String>,
+        indentation: f64,
+    },
+    ListItem {
+        bullet_type: BulletType,
+        indentation: f64,
+        content: String,
+        nested_level: usize,
+    },
+    CodeBlock {
+        lines: Vec<String>,
+    },
+    Table {
+        rows: Vec<TableRow>,
+        column_positions: Vec<f64>,
+        header_row_index: Option<usize>,
+    },
+}
+
+// ============================================================================
+// Stream Mode Table Detection Structures (Camelot/Nurminen's Algorithm)
+// ============================================================================
+
+/// Configuration for Stream mode table detection
+#[derive(Debug, Clone)]
+pub struct StreamConfig {
+    /// Minimum vertical alignment length (as fraction of table height) to consider an edge
+    /// Default: 0.5 (50% of table height)
+    pub edge_tol: f64,
+
+    /// Vertical tolerance for grouping text into rows (in points)
+    /// Default: 2.0
+    pub row_tol: f64,
+
+    /// Horizontal tolerance for merging column boundaries (in points)
+    /// Default: 5.0
+    pub column_tol: f64,
+
+    /// Minimum number of rows a text edge must intersect to be considered relevant
+    /// Default: 2
+    pub min_edge_intersections: usize,
+
+    /// Minimum table dimensions (in points)
+    pub min_table_width: f64,
+    pub min_table_height: f64,
+
+    /// Horizontal gap threshold for word consolidation (multiplier of font_size)
+    /// Text runs within this gap will be merged into single words before table detection
+    /// Default: 0.3
+    pub word_consolidation_gap: f64,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            edge_tol: 0.5,
+            row_tol: 2.0,
+            column_tol: 8.0,  // Nurminen's original value; character-level runs now consolidated before detection
+            word_consolidation_gap: 0.3,  // Match existing consolidate_runs behavior
+            min_edge_intersections: 4,  // Nurminen's REQUIRED_TEXT_LINES_FOR_EDGE
+            min_table_width: 50.0,
+            min_table_height: 30.0,
+        }
+    }
+}
+
+/// Type of text alignment edge
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EdgeAlignment {
+    /// Left edge of text
+    Left,
+    /// Right edge of text
+    Right,
+    /// Center of text
+    Center,
+}
+
+/// Bounding box for geometric operations
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundingBox {
+    pub x_min: f64,
+    pub y_min: f64,
+    pub x_max: f64,
+    pub y_max: f64,
+}
+
+impl BoundingBox {
+    /// Create from position and dimensions
+    #[inline]
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x_min: x,
+            y_min: y,
+            x_max: x + width,
+            y_max: y + height,
+        }
+    }
+
+    /// Check if point is inside bbox
+    #[inline]
+    pub fn contains_point(&self, x: f64, y: f64) -> bool {
+        x >= self.x_min && x <= self.x_max && y >= self.y_min && y <= self.y_max
+    }
+
+    /// Calculate intersection area with another bbox
+    pub fn intersection_area(&self, other: &BoundingBox) -> f64 {
+        let x_overlap = (self.x_max.min(other.x_max) - self.x_min.max(other.x_min)).max(0.0);
+        let y_overlap = (self.y_max.min(other.y_max) - self.y_min.max(other.y_min)).max(0.0);
+        x_overlap * y_overlap
+    }
+}
+
+/// A text element with position and dimensions
+#[derive(Debug, Clone)]
+pub struct TextElement {
+    /// Text content
+    pub text: String,
+    /// Bounding box
+    pub bbox: BoundingBox,
+    /// Font size
+    pub font_size: f64,
+    /// Font style metadata
+    pub font_style: FontStyle,
+}
+
+impl TextElement {
+    /// Get the left edge x-coordinate
+    #[inline]
+    pub fn left_edge(&self) -> f64 {
+        self.bbox.x_min
+    }
+
+    /// Get the right edge x-coordinate
+    #[inline]
+    pub fn right_edge(&self) -> f64 {
+        self.bbox.x_max
+    }
+
+    /// Get the center x-coordinate
+    #[inline]
+    pub fn center(&self) -> f64 {
+        (self.bbox.x_min + self.bbox.x_max) / 2.0
+    }
+
+    /// Get the width
+    #[inline]
+    pub fn width(&self) -> f64 {
+        self.bbox.x_max - self.bbox.x_min
+    }
+}
+
+/// Represents a vertical text alignment edge
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEdge {
+    /// X-coordinate of the edge
+    pub x: f64,
+    /// Y-coordinate where edge starts (top)
+    pub y_min: f64,
+    /// Y-coordinate where edge ends (bottom)
+    pub y_max: f64,
+    /// Type of alignment this edge represents
+    pub alignment: EdgeAlignment,
+    /// Number of text elements aligned to this edge
+    pub support_count: usize,
+    /// Confidence score (0.0-1.0) based on consistency
+    pub confidence: f64,
+}
+
+impl TextEdge {
+    /// Get the length (height) of this edge
+    #[inline]
+    pub fn length(&self) -> f64 {
+        self.y_max - self.y_min
+    }
+
+    /// Check if edge intersects with a horizontal band
+    #[inline]
+    pub fn intersects_row(&self, y: f64, tolerance: f64) -> bool {
+        y >= self.y_min - tolerance && y <= self.y_max + tolerance
+    }
+
+    /// Calculate overlap with another edge
+    pub fn vertical_overlap(&self, other: &TextEdge) -> f64 {
+        let overlap_start = self.y_min.max(other.y_min);
+        let overlap_end = self.y_max.min(other.y_max);
+        (overlap_end - overlap_start).max(0.0)
+    }
+
+    /// Count how many rows this edge intersects
+    pub fn count_row_intersections(&self, rows: &[TextRow]) -> usize {
+        rows.iter()
+            .filter(|row| row.y >= self.y_min && row.y <= self.y_max)
+            .count()
+    }
+}
+
+/// A row of text elements grouped by vertical position
+#[derive(Debug, Clone)]
+pub struct TextRow {
+    /// Y-coordinate (baseline or average)
+    pub y: f64,
+    /// Text runs in this row (sorted by x position)
+    pub elements: Vec<TextElement>,
+    /// Leftmost x coordinate
+    pub x_min: f64,
+    /// Rightmost x coordinate
+    pub x_max: f64,
+}
+
+impl TextRow {
+    /// Get the width of this row
+    #[inline]
+    pub fn width(&self) -> f64 {
+        self.x_max - self.x_min
+    }
+
+    /// Count number of word-like elements in this row
+    pub fn word_count(&self) -> usize {
+        self.elements.len()
+    }
+}
+
+/// Table detection mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableDetectionMode {
+    /// Disable table detection
+    Disabled,
+    /// Legacy column clustering algorithm (backward compatibility)
+    Legacy,
+    /// Stream mode (Nurminen's algorithm) - text-only
+    StreamMode,
+}
+
+/// Error type for table detection
+#[derive(Debug, thiserror::Error)]
+pub enum TableDetectionError {
+    #[error("No text rows found in region")]
+    NoTextRows,
+
+    #[error("Insufficient edges: found {0}, need at least {1}")]
+    InsufficientEdges(usize, usize),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+/// Cell in a detected table
+#[derive(Debug, Clone)]
+pub struct TableCell {
+    /// Row index (0-based)
+    pub row: usize,
+    /// Column index (0-based)
+    pub col: usize,
+    /// Text content
+    pub content: String,
+    /// Bounding box of the cell
+    pub bbox: BoundingBox,
+    /// Text elements in this cell
+    pub elements: Vec<TextElement>,
+}
+
+/// Metadata about table detection
+#[derive(Debug, Clone)]
+pub struct TableMetadata {
+    /// Detection algorithm used
+    pub algorithm: TableDetectionAlgorithm,
+    /// Number of columns detected
+    pub num_columns: usize,
+    /// Number of rows detected
+    pub num_rows: usize,
+    /// Statistical mode of words-per-row (if applicable)
+    pub mode_words_per_row: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableDetectionAlgorithm {
+    /// Legacy column clustering
+    Legacy,
+    /// Stream mode (Nurminen's algorithm)
+    StreamMode,
+}
+
+/// Represents a detected table region with Stream mode metadata
+#[derive(Debug, Clone)]
+pub struct TableRegion {
+    /// Bounding box of the table
+    pub bbox: BoundingBox,
+    /// Column boundaries (sorted x-coordinates)
+    pub columns: Vec<f64>,
+    /// Row y-coordinates (sorted)
+    pub rows: Vec<f64>,
+    /// Text elements organized by cell
+    pub cells: Vec<Vec<TableCell>>,
+    /// Detected edges used for column detection
+    pub edges: Vec<TextEdge>,
+    /// Confidence score (0.0-1.0)
+    pub confidence: f64,
+    /// Detection method metadata
+    pub metadata: TableMetadata,
+}
+
+/// Stream mode table detector implementing Nurminen's algorithm
+pub struct StreamTableDetector<'a> {
+    config: StreamConfig,
+    lines: &'a [TextLine],
+}
+
+impl<'a> StreamTableDetector<'a> {
+    /// Create a new StreamTableDetector
+    pub fn new(config: StreamConfig, lines: &'a [TextLine]) -> Self {
+        Self { config, lines }
+    }
+
+    /// Main entry point: detect all tables in the text
+    pub fn detect_tables(&self) -> Result<Vec<TableRegion>, TableDetectionError> {
+        // Step 1: Build text rows from lines
+        let text_rows = self.build_text_rows()?;
+
+        // Step 2: Generate text edges from aligned elements
+        let text_edges = self.generate_text_edges(&text_rows)?;
+
+        // Step 3: Select edges that intersect most rows
+        let relevant_edges = self.select_relevant_edges(&text_edges, &text_rows)?;
+
+        // Step 4: Convert edges to column boundaries
+        let boundaries = self.edges_to_boundaries(&relevant_edges)?;
+
+        // Step 5: Infer table bounding boxes
+        let regions = self.infer_table_boundaries(&text_rows, &boundaries)?;
+
+        // Step 6: Build table structures from regions
+        let mut tables = Vec::new();
+        for bbox in regions {
+            let table = self.build_table_from_region(bbox, &text_rows, &boundaries)?;
+            tables.push(table);
+        }
+
+        Ok(tables)
+    }
+
+    /// Build text rows by grouping text elements with similar y-coordinates
+    fn build_text_rows(&self) -> Result<Vec<TextRow>, TableDetectionError> {
+        if self.lines.is_empty() {
+            return Err(TableDetectionError::NoTextRows);
+        }
+
+        // Step 1: Collect all text elements from TextLines
+        let mut elements: Vec<TextElement> = Vec::new();
+        for line in self.lines {
+            for run in &line.runs {
+                elements.push(TextElement {
+                    text: run.text.clone(),
+                    bbox: BoundingBox::new(run.x, run.y, run.width, run.font_size),
+                    font_size: run.font_size,
+                    font_style: run.font_style,
+                });
+            }
+        }
+
+        if elements.is_empty() {
+            return Err(TableDetectionError::NoTextRows);
+        }
+
+        // Step 2: Sort by y-coordinate
+        elements.sort_by(|a, b| a.bbox.y_min.total_cmp(&b.bbox.y_min));
+
+        // Step 3: Group into rows using row_tol
+        let mut rows: Vec<TextRow> = Vec::new();
+        let mut current_row_elements: Vec<TextElement> = vec![elements[0].clone()];
+        let mut current_y = elements[0].bbox.y_min;
+
+        for elem in elements.into_iter().skip(1) {
+            if (elem.bbox.y_min - current_y).abs() <= self.config.row_tol {
+                current_row_elements.push(elem);
+            } else {
+                // Finalize current row
+                rows.push(Self::create_text_row(current_row_elements, current_y));
+                current_row_elements = vec![elem.clone()];
+                current_y = elem.bbox.y_min;
+            }
+        }
+
+        // Don't forget the last row
+        if !current_row_elements.is_empty() {
+            rows.push(Self::create_text_row(current_row_elements, current_y));
+        }
+
+        Ok(rows)
+    }
+
+    /// Helper to create a TextRow from elements
+    fn create_text_row(elements: Vec<TextElement>, y: f64) -> TextRow {
+        let x_min = elements
+            .iter()
+            .map(|e| e.bbox.x_min)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        let x_max = elements
+            .iter()
+            .map(|e| e.bbox.x_max)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        TextRow {
+            y,
+            elements,
+            x_min,
+            x_max,
+        }
+    }
+
+    /// Generate text edges from aligned text elements
+    fn generate_text_edges(&self, rows: &[TextRow]) -> Result<Vec<TextEdge>, TableDetectionError> {
+        use std::collections::HashMap;
+
+        // Step 1: Collect all edge candidates
+        let mut edge_candidates: HashMap<(EdgeAlignment, i32), Vec<(f64, f64, f64)>> =
+            HashMap::new();
+        // Key: (alignment_type, quantized_x), Value: Vec<(exact_x, y_min, y_max)>
+
+        for row in rows {
+            for elem in &row.elements {
+                // Left edge
+                let left_x = elem.left_edge();
+                let key_left = (
+                    EdgeAlignment::Left,
+                    (left_x / self.config.column_tol).round() as i32,
+                );
+                edge_candidates
+                    .entry(key_left)
+                    .or_insert_with(Vec::new)
+                    .push((left_x, row.y, row.y));
+
+                // Right edge
+                let right_x = elem.right_edge();
+                let key_right = (
+                    EdgeAlignment::Right,
+                    (right_x / self.config.column_tol).round() as i32,
+                );
+                edge_candidates
+                    .entry(key_right)
+                    .or_insert_with(Vec::new)
+                    .push((right_x, row.y, row.y));
+
+                // Center edge
+                let center_x = elem.center();
+                let key_center = (
+                    EdgeAlignment::Center,
+                    (center_x / self.config.column_tol).round() as i32,
+                );
+                edge_candidates
+                    .entry(key_center)
+                    .or_insert_with(Vec::new)
+                    .push((center_x, row.y, row.y));
+            }
+        }
+
+        // Step 2: Consolidate edges within column_tol
+        let mut edges: Vec<TextEdge> = Vec::new();
+        for ((alignment, _), positions) in edge_candidates {
+            if positions.len() < 2 {
+                continue; // Need at least 2 elements for an edge
+            }
+
+            // Calculate average x-coordinate
+            let avg_x = positions.iter().map(|(x, _, _)| x).sum::<f64>() / positions.len() as f64;
+
+            // Calculate y-extent
+            let y_min = positions
+                .iter()
+                .map(|(_, y, _)| y)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .copied()
+                .unwrap();
+            let y_max = positions
+                .iter()
+                .map(|(_, y, _)| y)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .copied()
+                .unwrap();
+
+            // Calculate confidence (based on x-coordinate variance)
+            let variance = positions
+                .iter()
+                .map(|(x, _, _)| (x - avg_x).powi(2))
+                .sum::<f64>()
+                / positions.len() as f64;
+            let confidence = 1.0 / (1.0 + variance); // Higher variance = lower confidence
+
+            edges.push(TextEdge {
+                x: avg_x,
+                y_min,
+                y_max,
+                alignment,
+                support_count: positions.len(),
+                confidence,
+            });
+        }
+
+        Ok(edges)
+    }
+
+    /// Select edges that intersect the most rows (relevant edges)
+    fn select_relevant_edges(
+        &self,
+        edges: &[TextEdge],
+        rows: &[TextRow],
+    ) -> Result<Vec<TextEdge>, TableDetectionError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Calculate table height
+        let table_y_min = rows
+            .iter()
+            .map(|r| r.y)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let table_y_max = rows
+            .iter()
+            .map(|r| r.y)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let table_height = table_y_max - table_y_min;
+
+        let min_edge_length = table_height * self.config.edge_tol;
+
+        // Filter edges by length and row intersections
+        let filtered_edges: Vec<TextEdge> = edges
+            .iter()
+            .filter(|edge| {
+                let edge_length = edge.length();
+                let intersections = edge.count_row_intersections(rows);
+
+                edge_length >= min_edge_length
+                    && intersections >= self.config.min_edge_intersections
+            })
+            .cloned()
+            .collect();
+
+        // CRITICAL: Nurminen's hierarchical edge type selection
+        // Select ONE edge type based on occurrence count:
+        // LEFT (if >2) > RIGHT (if >1) > CENTER (if >1)
+        use std::collections::HashMap;
+        let mut edge_counts: HashMap<EdgeAlignment, usize> = HashMap::new();
+
+        for edge in &filtered_edges {
+            *edge_counts.entry(edge.alignment).or_insert(0) += 1;
+        }
+
+        let left_count = edge_counts.get(&EdgeAlignment::Left).copied().unwrap_or(0);
+        let right_count = edge_counts.get(&EdgeAlignment::Right).copied().unwrap_or(0);
+        let center_count = edge_counts.get(&EdgeAlignment::Center).copied().unwrap_or(0);
+
+        log::debug!("Edge type counts - Left: {}, Right: {}, Center: {}",
+                   left_count, right_count, center_count);
+
+        // Select edge type based on Nurminen's hierarchy
+        let selected_alignment = if left_count > 2 {
+            log::debug!("Selected LEFT edges (count={})", left_count);
+            EdgeAlignment::Left
+        } else if right_count > 1 {
+            log::debug!("Selected RIGHT edges (count={})", right_count);
+            EdgeAlignment::Right
+        } else if center_count > 1 {
+            log::debug!("Selected CENTER edges (count={})", center_count);
+            EdgeAlignment::Center
+        } else {
+            // Fall back to whichever has the most
+            let max_type = edge_counts.iter()
+                .max_by_key(|(_, &count)| count)
+                .map(|(&alignment, _)| alignment);
+
+            if let Some(alignment) = max_type {
+                log::debug!("Selected {:?} edges by fallback", alignment);
+                alignment
+            } else {
+                return Ok(Vec::new());
+            }
+        };
+
+        // Return only edges of the selected type
+        let relevant_edges: Vec<TextEdge> = filtered_edges
+            .into_iter()
+            .filter(|edge| edge.alignment == selected_alignment)
+            .collect();
+
+        log::debug!("Selected {} edges of type {:?}", relevant_edges.len(), selected_alignment);
+
+        Ok(relevant_edges)
+    }
+
+    /// Convert edges to column boundaries
+    fn edges_to_boundaries(&self, edges: &[TextEdge]) -> Result<Vec<f64>, TableDetectionError> {
+        if edges.is_empty() {
+            return Err(TableDetectionError::InsufficientEdges(
+                0,
+                self.config.min_edge_intersections,
+            ));
+        }
+
+        // Extract x-coordinates and sort
+        let mut boundaries: Vec<f64> = edges.iter().map(|e| e.x).collect();
+        boundaries.sort_by(|a, b| a.total_cmp(b));
+
+        log::debug!("Before dedup: {} boundaries", boundaries.len());
+
+        // Deduplicate within column_tol
+        boundaries.dedup_by(|a, b| (*a - *b).abs() <= self.config.column_tol);
+
+        log::debug!("After dedup: {} boundaries (column_tol={})", boundaries.len(), self.config.column_tol);
+        if boundaries.len() <= 15 {
+            log::debug!("All boundaries: {:?}", boundaries);
+        } else {
+            log::debug!("First 15 boundaries: {:?}", &boundaries[..15]);
+        }
+
+        Ok(boundaries)
+    }
+
+    /// Infer table bounding boxes from rows and boundaries
+    fn infer_table_boundaries(
+        &self,
+        rows: &[TextRow],
+        boundaries: &[f64],
+    ) -> Result<Vec<BoundingBox>, TableDetectionError> {
+        if rows.is_empty() || boundaries.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // Simple approach for Phase 2: treat entire region as one table
+        let x_min = *boundaries.first().unwrap();
+        let x_max = *boundaries.last().unwrap();
+        let y_min = rows.first().unwrap().y;
+        let y_max = rows.last().unwrap().y;
+
+        let bbox = BoundingBox {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        };
+
+        // Filter by minimum dimensions
+        if (bbox.x_max - bbox.x_min) >= self.config.min_table_width
+            && (bbox.y_max - bbox.y_min) >= self.config.min_table_height
+        {
+            Ok(vec![bbox])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a complete table structure from a region
+    fn build_table_from_region(
+        &self,
+        bbox: BoundingBox,
+        rows: &[TextRow],
+        boundaries: &[f64],
+    ) -> Result<TableRegion, TableDetectionError> {
+        // Filter rows within bbox
+        let table_rows: Vec<&TextRow> = rows
+            .iter()
+            .filter(|r| r.y >= bbox.y_min && r.y <= bbox.y_max)
+            .collect();
+
+        // Build cells matrix
+        let mut cells: Vec<Vec<TableCell>> = Vec::new();
+        for (row_idx, row) in table_rows.iter().enumerate() {
+            let mut row_cells: Vec<TableCell> = Vec::new();
+
+            for col_idx in 0..boundaries.len() - 1 {
+                let col_x_min = boundaries[col_idx];
+                let col_x_max = boundaries[col_idx + 1];
+                let col_center = (col_x_min + col_x_max) / 2.0;
+
+                // Find elements in this cell - check if element's START position is closest to this column
+                let cell_elements: Vec<TextElement> = row
+                    .elements
+                    .iter()
+                    .filter(|e| {
+                        // Assign element to column if its left edge is within the column bounds
+                        // Use a relaxed tolerance to handle slight misalignments
+                        let elem_x = e.bbox.x_min;
+                        elem_x >= col_x_min && elem_x < col_x_max
+                    })
+                    .cloned()
+                    .collect();
+
+                // Sort elements by x-coordinate to maintain left-to-right order
+                let mut sorted_elements = cell_elements.clone();
+                sorted_elements.sort_by(|a, b| a.bbox.x_min.total_cmp(&b.bbox.x_min));
+
+                // Join text WITHOUT spaces - runs are already properly spaced
+                let cell_content = sorted_elements
+                    .iter()
+                    .map(|e| e.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                row_cells.push(TableCell {
+                    row: row_idx,
+                    col: col_idx,
+                    content: cell_content,
+                    bbox: BoundingBox {
+                        x_min: col_x_min,
+                        y_min: row.y,
+                        x_max: col_x_max,
+                        y_max: row.y + 10.0, // Estimate row height
+                    },
+                    elements: sorted_elements,
+                });
+            }
+
+            cells.push(row_cells);
+        }
+
+        let num_columns = boundaries.len() - 1;
+        let num_rows = cells.len();
+
+        let mut region = TableRegion {
+            bbox,
+            columns: boundaries.to_vec(),
+            rows: table_rows.iter().map(|r| r.y).collect(),
+            cells,
+            edges: Vec::new(),
+            confidence: 0.0,
+            metadata: TableMetadata {
+                algorithm: TableDetectionAlgorithm::StreamMode,
+                num_columns,
+                num_rows,
+                mode_words_per_row: None,
+            },
+        };
+
+        // Calculate confidence
+        region.confidence = self.calculate_table_confidence(&region);
+
+        Ok(region)
+    }
+
+    /// Calculate confidence score for a detected table
+    fn calculate_table_confidence(&self, region: &TableRegion) -> f64 {
+        if region.cells.is_empty() {
+            return 0.0;
+        }
+
+        // Metric 1: Cell occupancy (what % of cells have content)
+        let total_cells = region.cells.len()
+            * region
+                .cells
+                .get(0)
+                .map(|r| r.len())
+                .unwrap_or(0);
+        let filled_cells = region
+            .cells
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|cell| !cell.content.trim().is_empty())
+            .count();
+
+        let occupancy_score = if total_cells > 0 {
+            filled_cells as f64 / total_cells as f64
+        } else {
+            0.0
+        };
+
+        // Metric 2: Row consistency (variance of cell counts per row)
+        let row_lengths: Vec<usize> = region.cells.iter().map(|row| row.len()).collect();
+        if row_lengths.is_empty() {
+            return occupancy_score;
+        }
+
+        let avg_length = row_lengths.iter().sum::<usize>() as f64 / row_lengths.len() as f64;
+        let variance = row_lengths
+            .iter()
+            .map(|&len| (len as f64 - avg_length).powi(2))
+            .sum::<f64>()
+            / row_lengths.len() as f64;
+
+        let consistency_score = 1.0 / (1.0 + variance);
+
+        // Metric 3: Edge confidence (average of all edge confidences)
+        let edge_confidence = if !region.edges.is_empty() {
+            region.edges.iter().map(|e| e.confidence).sum::<f64>() / region.edges.len() as f64
+        } else {
+            0.5 // Neutral if no edges
+        };
+
+        // Combined score (weighted average)
+        (occupancy_score * 0.4 + consistency_score * 0.3 + edge_confidence * 0.3).clamp(0.0, 1.0)
+    }
+
+    /// Refine column boundaries using statistical mode analysis
+    fn refine_columns_with_mode(&self, rows: &[TextRow]) -> Vec<f64> {
+        use std::collections::HashMap;
+
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 1: Calculate word count per row
+        let word_counts: Vec<usize> = rows.iter().map(|row| row.word_count()).collect();
+
+        // Step 2: Find mode (most common count)
+        let mut frequency_map: HashMap<usize, usize> = HashMap::new();
+        for &count in &word_counts {
+            *frequency_map.entry(count).or_insert(0) += 1;
+        }
+
+        let mode = frequency_map
+            .iter()
+            .max_by_key(|(_, &freq)| freq)
+            .map(|(&count, _)| count)
+            .unwrap_or(0);
+
+        if mode == 0 {
+            return Vec::new();
+        }
+
+        // Step 3: Find rows matching mode and extract their column boundaries
+        let mode_rows: Vec<&TextRow> = rows
+            .iter()
+            .filter(|row| row.word_count() == mode)
+            .collect();
+
+        if mode_rows.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 4: Cluster element positions to find column boundaries
+        let mut all_positions: Vec<f64> = mode_rows
+            .iter()
+            .flat_map(|row| row.elements.iter().map(|e| e.left_edge()))
+            .collect();
+
+        if all_positions.is_empty() {
+            return Vec::new();
+        }
+
+        all_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Merge nearby positions
+        let mut boundaries = Vec::new();
+        let mut current_cluster = vec![all_positions[0]];
+
+        for &pos in &all_positions[1..] {
+            if pos - current_cluster.last().unwrap() <= self.config.column_tol {
+                current_cluster.push(pos);
+            } else {
+                // Calculate cluster average
+                let avg = current_cluster.iter().sum::<f64>() / current_cluster.len() as f64;
+                boundaries.push(avg);
+                current_cluster = vec![pos];
+            }
+        }
+
+        // Don't forget last cluster
+        if !current_cluster.is_empty() {
+            boundaries.push(current_cluster.iter().sum::<f64>() / current_cluster.len() as f64);
+        }
+
+        boundaries
+    }
+}
+
+/// Configuration for markdown extraction heuristics
+#[derive(Debug, Clone)]
+pub struct MarkdownConfig {
+    /// Minimum font size increase to consider heading (multiplier)
+    pub heading_font_size_threshold: f64,
+
+    /// Maximum heading levels to detect (1-6)
+    pub max_heading_level: u8,
+
+    /// Vertical spacing threshold for paragraph breaks (multiplier of font_size)
+    pub paragraph_spacing_threshold: f64,
+
+    /// Horizontal spacing threshold for word breaks (multiplier)
+    pub word_spacing_threshold: f64,
+
+    /// Indentation threshold for list detection (points)
+    pub list_indent_threshold: f64,
+
+    /// Detect code blocks based on monospace font runs
+    pub detect_code_blocks: bool,
+
+    /// Minimum consecutive monospace lines to form code block
+    pub min_code_block_lines: usize,
+
+    /// List bullet characters to recognize
+    pub bullet_chars: Vec<char>,
+
+    // Enhanced heading detection
+    /// Enable bold text as heading indicator
+    pub enable_bold_heading_detection: bool,
+
+    /// Enable all-caps text as heading indicator
+    pub enable_allcaps_heading_detection: bool,
+
+    /// Enable centered text as heading indicator
+    pub enable_centered_heading_detection: bool,
+
+    /// Minimum confidence score to consider heading (0-10)
+    pub heading_confidence_threshold: u8,
+
+    /// Maximum line width ratio for headings (0.0-1.0)
+    pub max_heading_line_length_ratio: f64,
+
+    // Table detection
+    /// Enable table detection
+    pub enable_table_detection: bool,
+
+    /// Column alignment tolerance (points)
+    pub table_column_tolerance: f64,
+
+    /// Minimum rows required for table detection
+    pub min_table_rows: usize,
+
+    /// Minimum columns required for table detection
+    pub min_table_columns: usize,
+
+    /// Table detection algorithm mode
+    pub table_detection_mode: TableDetectionMode,
+
+    /// Configuration for Stream mode table detection
+    pub stream_config: StreamConfig,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        Self {
+            heading_font_size_threshold: 1.1,
+            max_heading_level: 6,
+            paragraph_spacing_threshold: 1.5,
+            word_spacing_threshold: 0.3,
+            list_indent_threshold: 20.0,
+            detect_code_blocks: true,
+            min_code_block_lines: 2,
+            bullet_chars: vec!['•', '■', '▪', '◦', '◘', '○', '-', '*', '·'],
+
+            // Enhanced heading detection
+            enable_bold_heading_detection: true,
+            enable_allcaps_heading_detection: true,
+            enable_centered_heading_detection: true,
+            heading_confidence_threshold: 4,
+            max_heading_line_length_ratio: 0.8,
+
+            // Table detection
+            enable_table_detection: true,
+            table_column_tolerance: 15.0,
+            min_table_rows: 4,
+            min_table_columns: 2,
+            table_detection_mode: TableDetectionMode::StreamMode,
+            stream_config: StreamConfig::default(),
+        }
+    }
+}
+
+/// Statistics collected per page for adaptive heuristics
+#[derive(Debug, Default)]
+struct PageStatistics {
+    /// Font sizes seen on this page
+    font_sizes: Vec<f64>,
+
+    /// Most common font size (body text baseline)
+    body_font_size: Option<f64>,
+
+    /// Line spacings observed
+    line_spacings: Vec<f64>,
+
+    /// Average line spacing
+    avg_line_spacing: f64,
+
+    /// Indentation levels observed
+    indent_levels: Vec<f64>,
+
+    /// Page dimensions (for centering detection)
+    page_width: f64,
+    page_height: f64,
+}
+
+// ==================== Markdown Output Implementation ====================
+
+/// The main MarkdownOutput implementation
+pub struct MarkdownOutput<W: ConvertToFmt> {
+    /// Writer for output
+    writer: W::Writer,
+
+    /// Transform for coordinate conversion
+    flip_ctm: Transform,
+
+    /// Current page number
+    current_page: u32,
+
+    /// Buffer for accumulating text runs
+    run_buffer: Vec<TextRun>,
+
+    /// Current text being accumulated within a run
+    current_run_text: String,
+
+    /// Position of last character
+    last_x: f64,
+    last_y: f64,
+
+    /// Position where current run started
+    run_start_x: f64,
+    run_start_y: f64,
+
+    /// Font context for current text
+    current_font_style: FontStyle,
+    current_font_size: f64,
+
+    /// Character counter for debugging
+    char_counter: usize,
+
+    /// Lines assembled from runs
+    assembled_lines: Vec<TextLine>,
+
+    /// Blocks detected from lines
+    blocks: Vec<Block>,
+
+    /// Configuration for heuristics
+    config: MarkdownConfig,
+
+    /// Statistics for adaptive thresholds
+    stats: PageStatistics,
+
+    /// Stream mode table regions (if using Stream mode detection)
+    stream_table_regions: Vec<TableRegion>,
+}
+
+impl<W: ConvertToFmt> MarkdownOutput<W> {
+    /// Create new MarkdownOutput with default configuration
+    pub fn new(writer: W) -> Self {
+        Self::with_config(writer, MarkdownConfig::default())
+    }
+
+    /// Create new MarkdownOutput with custom configuration
+    pub fn with_config(writer: W, config: MarkdownConfig) -> Self {
+        Self {
+            writer: writer.convert(),
+            flip_ctm: Transform2D::identity(),
+            current_page: 0,
+            run_buffer: Vec::new(),
+            current_run_text: String::new(),
+            last_x: 0.0,
+            last_y: 0.0,
+            run_start_x: 0.0,
+            run_start_y: 0.0,
+            current_font_style: FontStyle::default(),
+            current_font_size: 0.0,
+            char_counter: 0,
+            assembled_lines: Vec::new(),
+            blocks: Vec::new(),
+            config,
+            stats: PageStatistics::default(),
+            stream_table_regions: Vec::new(),
+        }
+    }
+
+    /// Check if we need to start a new text run
+    fn should_start_new_run(&self, x: f64, y: f64, font_size: f64) -> bool {
+        if self.current_run_text.is_empty() {
+            return false;
+        }
+
+        let y_diff = (y - self.last_y).abs();
+        let x_gap = x - self.last_x;
+        let font_changed = (font_size - self.current_font_size).abs() > 0.1;
+
+        // Start new run if:
+        // - Font size changed
+        // - Large vertical movement
+        // - Large horizontal gap (potential word spacing)
+        font_changed
+            || y_diff > font_size * 0.5
+            || x_gap > font_size * self.config.word_spacing_threshold
+    }
+
+    /// Flush current accumulated text into a TextRun
+    fn flush_current_run(&mut self) {
+        if self.current_run_text.is_empty() {
+            return;
+        }
+
+        let run = TextRun {
+            text: std::mem::take(&mut self.current_run_text),
+            font_size: self.current_font_size,
+            font_style: self.current_font_style,
+            x: self.run_start_x,  // Use START position, not end
+            y: self.run_start_y,  // Use START position, not end
+            width: self.last_x - self.run_start_x,  // Calculate actual width
+            char_index: self.char_counter,
+        };
+
+        self.run_buffer.push(run);
+    }
+
+    /// Convert a text line to a string
+    fn line_to_text(&self, line: &TextLine) -> String {
+        let mut result = String::new();
+        let mut last_end_x = 0.0;
+
+        for run in &line.runs {
+            // If there's a gap, add a space
+            if !result.is_empty() && run.x > last_end_x + run.font_size * 0.2 {
+                result.push(' ');
+            }
+            result.push_str(&run.text);
+            last_end_x = run.x + run.width;
+        }
+
+        result
+    }
+
+    /// Get dominant style (most common) from runs
+    fn get_dominant_style(&self, runs: &[TextRun]) -> FontStyle {
+        if runs.is_empty() {
+            return FontStyle::default();
+        }
+
+        // Count style occurrences
+        let mut style_counts: HashMap<(bool, bool, bool), usize> = HashMap::new();
+
+        for run in runs {
+            let key = (run.font_style.is_bold, run.font_style.is_italic, run.font_style.is_monospace);
+            *style_counts.entry(key).or_insert(0) += 1;
+        }
+
+        // Get most common style
+        if let Some(((is_bold, is_italic, is_monospace), _)) =
+            style_counts.iter().max_by_key(|&(_, count)| count) {
+            FontStyle {
+                is_bold: *is_bold,
+                is_italic: *is_italic,
+                is_monospace: *is_monospace,
+                family: runs[0].font_style.family,
+            }
+        } else {
+            runs[0].font_style
+        }
+    }
+
+    /// Check if line text is all uppercase
+    fn is_line_all_caps(&self, line: &TextLine) -> bool {
+        let text = self.line_to_text(line);
+        let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+
+        if alpha_chars.is_empty() {
+            return false;
+        }
+
+        alpha_chars.iter().all(|c| c.is_uppercase())
+    }
+
+    /// Check if line appears centered on page
+    fn is_line_centered(&self, line: &TextLine) -> bool {
+        let page_width = self.stats.page_width;
+        if page_width == 0.0 {
+            return false;
+        }
+
+        let page_center = page_width / 2.0;
+        let line_length = self.estimate_line_width(line);
+        let line_center = line.x_start + line_length / 2.0;
+
+        // Within 10% of page center
+        (line_center - page_center).abs() < page_width * 0.1
+    }
+
+    /// Get spacing before and after a line
+    fn get_surrounding_spacing(&self, line_index: usize) -> (f64, f64) {
+        let spacing_before = if line_index > 0 {
+            (self.assembled_lines[line_index].y
+             - self.assembled_lines[line_index - 1].y).abs()
+        } else {
+            0.0
+        };
+
+        let spacing_after = if line_index < self.assembled_lines.len() - 1 {
+            (self.assembled_lines[line_index + 1].y
+             - self.assembled_lines[line_index].y).abs()
+        } else {
+            0.0
+        };
+
+        (spacing_before, spacing_after)
+    }
+
+    /// Estimate line width from runs
+    fn estimate_line_width(&self, line: &TextLine) -> f64 {
+        if line.runs.is_empty() {
+            return 0.0;
+        }
+
+        let leftmost = line.runs.iter()
+            .map(|r| r.x)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+
+        let rightmost = line.runs.iter()
+            .map(|r| r.x + r.width)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+
+        rightmost - leftmost
+    }
+
+    /// Consolidate adjacent runs with configurable gap threshold
+    /// Merges runs with the same style that are within gap_threshold * font_size distance
+    fn consolidate_runs_configurable(runs: Vec<TextRun>, gap_threshold: f64) -> Vec<TextRun> {
+        if runs.is_empty() {
+            return runs;
+        }
+
+        let mut consolidated = Vec::new();
+        let mut current_run = runs[0].clone();
+
+        for run in runs.into_iter().skip(1) {
+            // Calculate gap size with minimum threshold to handle zero/small font sizes
+            let gap_size = (current_run.font_size * gap_threshold).max(2.0);
+
+            // Check if runs can be merged (same style, close position)
+            if run.font_style == current_run.font_style
+                && (run.x - (current_run.x + current_run.width)).abs() < gap_size {
+                // Merge runs
+                current_run.text.push_str(&run.text);
+                current_run.width = run.x + run.width - current_run.x;
+            } else {
+                // Save current run and start new one
+                consolidated.push(current_run);
+                current_run = run;
+            }
+        }
+
+        consolidated.push(current_run);
+        consolidated
+    }
+
+    /// Create a TextLine from a group of runs
+    /// Consolidate adjacent runs with the same style
+    fn consolidate_runs(runs: Vec<TextRun>) -> Vec<TextRun> {
+        Self::consolidate_runs_configurable(runs, 0.3)
+    }
+
+    /// Pre-consolidate lines for table detection
+    /// Merges character-level runs into word-level runs to improve column detection accuracy
+    fn pre_consolidate_lines_for_table_detection(&self, lines: &[TextLine]) -> Vec<TextLine> {
+        let gap_threshold = self.config.stream_config.word_consolidation_gap;
+
+        lines.iter().map(|line| {
+            // Consolidate runs using configurable threshold
+            let consolidated_runs = Self::consolidate_runs_configurable(
+                line.runs.clone(),
+                gap_threshold
+            );
+
+            // Recalculate x_start (leftmost position)
+            let x_start = consolidated_runs.iter()
+                .map(|r| r.x)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(line.x_start);
+
+            // Rebuild TextLine with consolidated runs
+            TextLine {
+                runs: consolidated_runs,
+                y: line.y,
+                x_start,
+                avg_font_size: line.avg_font_size,
+                dominant_style: line.dominant_style,
+            }
+        }).collect()
+    }
+
+    fn create_text_line(&self, runs: Vec<TextRun>) -> TextLine {
+        let runs = Self::consolidate_runs(runs);
+        let y = runs.iter().map(|r| r.y).sum::<f64>() / runs.len() as f64;
+        let x_start = runs.iter()
+            .map(|r| r.x)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        let avg_font_size = runs.iter().map(|r| r.font_size).sum::<f64>() / runs.len() as f64;
+
+        // Determine dominant style (most common)
+        let dominant_style = self.get_dominant_style(&runs);
+
+        TextLine {
+            runs,
+            y,
+            x_start,
+            avg_font_size,
+            dominant_style,
+        }
+    }
+
+    /// Assemble accumulated runs into lines
+    fn assemble_lines(&mut self) {
+        if self.run_buffer.is_empty() {
+            return;
+        }
+
+        // Sort runs by Y position (ascending), then X position (ascending)
+        // Use total_cmp to handle NaN values (treats NaN as less than all other values)
+        self.run_buffer.sort_by(|a, b| {
+            a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x))
+        });
+
+        // Take ownership of the run buffer to avoid borrowing issues
+        let runs = std::mem::take(&mut self.run_buffer);
+        let mut lines: Vec<TextLine> = Vec::new();
+        let mut current_line_runs: Vec<TextRun> = Vec::new();
+        let mut current_y = runs[0].y;
+
+        for run in runs {
+            let y_diff = (run.y - current_y).abs();
+            let font_size_threshold = run.font_size * 0.3;
+
+            // Check if this run belongs to current line or new line
+            if y_diff > font_size_threshold && !current_line_runs.is_empty() {
+                // Finalize current line
+                let line = self.create_text_line(std::mem::take(&mut current_line_runs));
+                lines.push(line);
+
+                // Start new line with current run
+                current_y = run.y;
+                current_line_runs.push(run);
+            } else {
+                current_line_runs.push(run);
+            }
+        }
+
+        // Don't forget the last line
+        if !current_line_runs.is_empty() {
+            let line = self.create_text_line(current_line_runs);
+            lines.push(line);
+        }
+
+        self.assembled_lines.extend(lines);
+    }
+
+    /// Calculate body font size from statistics (using median for robustness)
+    fn calculate_body_font_size(&mut self) {
+        if self.stats.font_sizes.is_empty() {
+            return;
+        }
+
+        // Use median as body font size (more robust than mean)
+        let mut sizes = self.stats.font_sizes.clone();
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_idx = sizes.len() / 2;
+        self.stats.body_font_size = Some(sizes[median_idx]);
+    }
+
+    /// Calculate statistics for adaptive heuristics
+    fn calculate_statistics(&mut self) {
+        // Collect font sizes
+        for line in &self.assembled_lines {
+            self.stats.font_sizes.push(line.avg_font_size);
+        }
+
+        // Calculate body font size
+        self.calculate_body_font_size();
+
+        // DEBUG: Log font size statistics
+        if let Some(body_size) = self.stats.body_font_size {
+            log::debug!("Body font size (median): {}", body_size);
+            if let Some(&max_size) = self.stats.font_sizes.iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)) {
+                log::debug!("Max font size: {}", max_size);
+                log::debug!("Ratio: {}", max_size / body_size);
+            }
+        }
+
+        // Calculate page dimensions from line positions
+        if !self.assembled_lines.is_empty() {
+            let max_x = self.assembled_lines.iter()
+                .flat_map(|line| line.runs.iter())
+                .map(|run| run.x + run.width)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+
+            self.stats.page_width = max_x * 1.1; // Add 10% margin
+
+            let max_y = self.assembled_lines.iter()
+                .map(|line| line.y)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+
+            self.stats.page_height = max_y * 1.1;
+        }
+
+        // Collect line spacings
+        for i in 1..self.assembled_lines.len() {
+            let spacing = (self.assembled_lines[i].y - self.assembled_lines[i-1].y).abs();
+            self.stats.line_spacings.push(spacing);
+        }
+
+        // Calculate average spacing
+        if !self.stats.line_spacings.is_empty() {
+            self.stats.avg_line_spacing =
+                self.stats.line_spacings.iter().sum::<f64>() / self.stats.line_spacings.len() as f64;
+        }
+
+        // Collect indent levels (cluster)
+        let mut indent_map: HashMap<i32, f64> = HashMap::new();
+        for line in &self.assembled_lines {
+            let rounded = (line.x_start / 10.0).round() as i32;
+            indent_map.entry(rounded).or_insert(line.x_start);
+        }
+        self.stats.indent_levels = indent_map.values().copied().collect();
+    }
+
+    /// Detect if a line is a heading based on font size
+    /// Detect if line is a heading using multiple heuristics
+    fn detect_heading(&self, line: &TextLine, line_index: usize) -> Option<u8> {
+        let text = self.line_to_text(line);
+        let trimmed = text.trim();
+
+        // Exclude patterns that shouldn't be headings
+
+        // 1. Page numbers: "1/5", "4/5", etc.
+        if trimmed.contains('/') && trimmed.len() <= 5 {
+            let parts: Vec<&str> = trimmed.split('/').collect();
+            if parts.len() == 2 && parts.iter().all(|p| p.trim().parse::<u32>().is_ok()) {
+                return None;
+            }
+        }
+
+        // 2. Pure numbers or amounts: "150k", "300k", "100%", "-50 000"
+        if trimmed.len() < 30 {
+            let num_chars = trimmed.chars().filter(|c| c.is_numeric()).count();
+            if num_chars as f64 / trimmed.len() as f64 > 0.5 {
+                return None;
+            }
+        }
+
+        // 3. Too short: require minimum length
+        if trimmed.len() < 5 {
+            return None;
+        }
+
+        let mut score = 0u8;
+        let body_size = self.stats.body_font_size.unwrap_or(12.0);
+        let size_ratio = line.avg_font_size / body_size;
+
+        // Heuristic 1: Font size increase
+        if size_ratio >= 2.0 {
+            score += 6;
+        } else if size_ratio >= 1.7 {
+            score += 5;
+        } else if size_ratio >= 1.5 {
+            score += 4;
+        } else if size_ratio >= 1.35 {
+            score += 3;
+        } else if size_ratio >= 1.25 {
+            score += 2;
+        } else if size_ratio >= 1.1 {
+            score += 1;
+        }
+
+        // Heuristic 2: Bold text
+        if self.config.enable_bold_heading_detection && line.dominant_style.is_bold {
+            score += 2;
+        }
+
+        // Heuristic 3: All caps
+        if self.config.enable_allcaps_heading_detection && self.is_line_all_caps(line) {
+            score += 2;
+        }
+
+        // Heuristic 4: Centered
+        if self.config.enable_centered_heading_detection && self.is_line_centered(line) {
+            score += 1;
+        }
+
+        // Heuristic 5: Whitespace context
+        let (spacing_before, spacing_after) = self.get_surrounding_spacing(line_index);
+        let avg_spacing = self.stats.avg_line_spacing;
+
+        if avg_spacing > 0.0 {
+            if spacing_before > avg_spacing * 2.0 {
+                score += 1;
+            }
+            if spacing_after > avg_spacing * 1.5 {
+                score += 1;
+            }
+        }
+
+        // Heuristic 6: Short line (not full width)
+        let line_width = self.estimate_line_width(line);
+        if line_width < self.stats.page_width * self.config.max_heading_line_length_ratio {
+            score += 1;
+        }
+
+        // Check threshold
+        if score < self.config.heading_confidence_threshold {
+            return None;
+        }
+
+        // Assign heading level based on score and size
+        let level = if score >= 8 || size_ratio >= 2.0 {
+            1
+        } else if score >= 6 || size_ratio >= 1.7 {
+            2
+        } else if score >= 5 || size_ratio >= 1.5 {
+            3
+        } else if score >= 4 || size_ratio >= 1.35 {
+            4
+        } else if score >= 3 || size_ratio >= 1.25 {
+            5
+        } else {
+            6
+        };
+
+        // Clamp to configured max level
+        Some(level.min(self.config.max_heading_level))
+    }
+
+    /// Calculate nesting level based on indentation
+    fn calculate_nesting_level(&self, x_start: f64) -> usize {
+        if self.stats.indent_levels.is_empty() {
+            return 0;
+        }
+
+        // Find closest indent level
+        let mut levels = self.stats.indent_levels.clone();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (idx, &level) in levels.iter().enumerate() {
+            if (x_start - level).abs() < self.config.list_indent_threshold {
+                return idx;
+            }
+        }
+
+        0
+    }
+
+    /// Match ordered list patterns using regex
+    fn match_ordered_list_pattern(&self, text: &str) -> Option<BulletType> {
+        use regex::Regex;
+        lazy_static::lazy_static! {
+            static ref ORDERED_PATTERN: Regex = Regex::new(
+                r"^(\(?\d+[\.\)]|\(?[a-z][\.\)]|\(?[A-Z][\.\)]|\(?[ivxlcdm]+[\.\)])"
+            ).unwrap();
+        }
+
+        if ORDERED_PATTERN.is_match(text) {
+            Some(BulletType::Ordered)
+        } else {
+            None
+        }
+    }
+
+    /// Detect if a line is a list item
+    fn detect_list_item(&self, line: &TextLine) -> Option<(BulletType, usize)> {
+        let text = self.line_to_text(line);
+        let trimmed = text.trim_start();
+
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let first_char = trimmed.chars().next()?;
+
+        // Check for unordered list bullets
+        if self.config.bullet_chars.contains(&first_char) {
+            let nest_level = self.calculate_nesting_level(line.x_start);
+            return Some((BulletType::Unordered, nest_level));
+        }
+
+        // Check for ordered list patterns: "1.", "a)", "(i)", etc.
+        if let Some(bullet_type) = self.match_ordered_list_pattern(trimmed) {
+            let nest_level = self.calculate_nesting_level(line.x_start);
+            return Some((bullet_type, nest_level));
+        }
+
+        None
+    }
+
+    /// Convert a text line to markdown with emphasis
+    fn line_to_markdown(&self, line: &TextLine) -> String {
+        let mut result = String::new();
+        let baseline_style = line.dominant_style;
+
+        for run in &line.runs {
+            let text = &run.text;
+
+            // Apply emphasis if style differs from baseline
+            let needs_bold = run.font_style.is_bold && !baseline_style.is_bold;
+            let needs_italic = run.font_style.is_italic && !baseline_style.is_italic;
+            let needs_code = run.font_style.is_monospace && !baseline_style.is_monospace;
+
+            let formatted = if needs_code {
+                format!("`{}`", text)
+            } else if needs_bold && needs_italic {
+                format!("***{}***", text)
+            } else if needs_bold {
+                format!("**{}**", text)
+            } else if needs_italic {
+                format!("*{}*", text)
+            } else {
+                text.clone()
+            };
+
+            result.push_str(&formatted);
+        }
+
+        result
+    }
+
+    /// Cluster X positions into columns
+    fn cluster_columns(&self, x_positions: &[f64]) -> Vec<f64> {
+        if x_positions.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sorted = x_positions.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let tolerance = self.config.table_column_tolerance;
+        let mut clusters = Vec::new();
+        let mut current_cluster = vec![sorted[0]];
+
+        for &pos in sorted.iter().skip(1) {
+            if pos - current_cluster.last().unwrap() <= tolerance {
+                current_cluster.push(pos);
+            } else {
+                // Finalize current cluster (use median)
+                let median_idx = current_cluster.len() / 2;
+                clusters.push(current_cluster[median_idx]);
+                current_cluster = vec![pos];
+            }
+        }
+
+        // Don't forget last cluster
+        if !current_cluster.is_empty() {
+            let median_idx = current_cluster.len() / 2;
+            clusters.push(current_cluster[median_idx]);
+        }
+
+        clusters
+    }
+
+    /// Validate that a potential table region has valid content characteristics
+    fn is_valid_table_region(&self, start: usize, end: usize) -> bool {
+        let row_count = end - start + 1;
+
+        // Reject if too few rows
+        if row_count < self.config.min_table_rows {
+            return false;
+        }
+
+        // Check each row for valid table characteristics
+        let mut rows_with_multiple_cells = 0;
+        let mut total_cell_length = 0;
+        let mut non_empty_cell_count = 0;
+        let mut max_columns = 0;
+
+        for i in start..=end {
+            let line = &self.assembled_lines[i];
+
+            if line.runs.len() > max_columns {
+                max_columns = line.runs.len();
+            }
+
+            // Count runs (potential cells)
+            if line.runs.len() >= self.config.min_table_columns {
+                rows_with_multiple_cells += 1;
+
+                // Check cell content quality (only non-empty cells)
+                for run in &line.runs {
+                    let trimmed = run.text.trim();
+                    if !trimmed.is_empty() {
+                        total_cell_length += trimmed.len();
+                        non_empty_cell_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Require most rows to have enough columns
+        let multi_column_ratio = rows_with_multiple_cells as f64 / row_count as f64;
+        if multi_column_ratio < 0.7 {  // 70% of rows must have multiple columns (relaxed from 80%)
+            return false;
+        }
+
+        // Reject character-level tables: many columns AND very short cells
+        if max_columns > 8 && non_empty_cell_count > 0 {
+            let avg_cell_length = total_cell_length as f64 / non_empty_cell_count as f64;
+            if avg_cell_length < 1.5 {  // Character-level tables have avg ~1.0
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Detect table regions in assembled lines
+    /// Legacy table detection using column clustering
+    fn detect_table_regions_legacy(&self) -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        let mut i = 0;
+
+        while i < self.assembled_lines.len() {
+            // Check if line could start a table
+            if self.assembled_lines[i].runs.len() >= self.config.min_table_columns {
+                // Look ahead for consistent column pattern
+                let mut end = i;
+                let columns = self.extract_columns_from_line(&self.assembled_lines[i]);
+
+                // Scan consecutive lines for alignment
+                while end + 1 < self.assembled_lines.len() {
+                    let next_line = &self.assembled_lines[end + 1];
+                    if self.line_aligns_with_columns(next_line, &columns) {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Valid table if enough rows AND passes content validation
+                let row_count = end - i + 1;
+                if row_count >= self.config.min_table_rows && self.is_valid_table_region(i, end) {
+                    regions.push((i, end));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        regions
+    }
+
+    /// Stream mode table detection using Nurminen's algorithm
+    fn detect_table_regions_stream(&mut self) -> Vec<(usize, usize)> {
+        log::debug!("Using Stream mode table detection");
+
+        // PRE-CONSOLIDATE: Merge character-level runs into word-level runs
+        let consolidated_lines = self.pre_consolidate_lines_for_table_detection(&self.assembled_lines);
+
+        let total_runs_before: usize = self.assembled_lines.iter().map(|l| l.runs.len()).sum();
+        let total_runs_after: usize = consolidated_lines.iter().map(|l| l.runs.len()).sum();
+
+        log::debug!(
+            "Pre-consolidation: {} lines, {} runs before, {} runs after (reduction: {:.1}%)",
+            self.assembled_lines.len(),
+            total_runs_before,
+            total_runs_after,
+            if total_runs_before > 0 {
+                (1.0 - total_runs_after as f64 / total_runs_before as f64) * 100.0
+            } else {
+                0.0
+            }
+        );
+
+        // Create StreamTableDetector with consolidated lines
+        let detector = StreamTableDetector::new(
+            self.config.stream_config.clone(),
+            &consolidated_lines,  // Use consolidated, not original
+        );
+
+        // Call detect_tables()
+        match detector.detect_tables() {
+            Ok(table_regions) => {
+                log::debug!("Stream mode found {} table region(s)", table_regions.len());
+
+                // Convert TableRegion to (start_line, end_line) tuples
+                let line_ranges = self.convert_table_regions_to_line_ranges(&table_regions);
+
+                // Store the full TableRegion data for later use in extract_table()
+                self.stream_table_regions = table_regions;
+
+                line_ranges
+            }
+            Err(e) => {
+                log::warn!("Stream table detection failed: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Convert TableRegion bounding boxes to line index ranges
+    fn convert_table_regions_to_line_ranges(&self, regions: &[TableRegion]) -> Vec<(usize, usize)> {
+        let mut line_ranges = Vec::new();
+
+        for region in regions {
+            log::debug!(
+                "Table region: bbox=({:.1}, {:.1}) to ({:.1}, {:.1}), confidence={:.2}",
+                region.bbox.x_min,
+                region.bbox.y_min,
+                region.bbox.x_max,
+                region.bbox.y_max,
+                region.confidence
+            );
+
+            // Find lines within this table's bounding box by y-coordinate
+            let mut start_line: Option<usize> = None;
+            let mut end_line: Option<usize> = None;
+
+            for (idx, line) in self.assembled_lines.iter().enumerate() {
+                // Check if line's y-coordinate is within the table region
+                if line.y >= region.bbox.y_min && line.y <= region.bbox.y_max {
+                    if start_line.is_none() {
+                        start_line = Some(idx);
+                    }
+                    end_line = Some(idx);
+                }
+            }
+
+            if let (Some(start), Some(end)) = (start_line, end_line) {
+                log::debug!("  Mapped to lines {} to {}", start, end);
+                line_ranges.push((start, end));
+            } else {
+                log::warn!("Could not map table region to line ranges");
+            }
+        }
+
+        line_ranges
+    }
+
+    /// Extract column positions from a line's runs
+    fn extract_columns_from_line(&self, line: &TextLine) -> Vec<f64> {
+        let x_positions: Vec<f64> = line.runs.iter().map(|r| r.x).collect();
+        self.cluster_columns(&x_positions)
+    }
+
+    /// Check if line's runs align with given columns
+    fn line_aligns_with_columns(&self, line: &TextLine, columns: &[f64]) -> bool {
+        let tolerance = self.config.table_column_tolerance;
+        let mut aligned_count = 0;
+
+        for run in &line.runs {
+            for &col_x in columns {
+                if (run.x - col_x).abs() <= tolerance {
+                    aligned_count += 1;
+                    break;
+                }
+            }
+        }
+
+        // Require 65% of columns to be present (relaxed from 50% baseline)
+        aligned_count >= (columns.len() * 13 + 19) / 20
+    }
+
+    /// Extract table from line range
+    fn extract_table(&self, start: usize, end: usize) -> Block {
+        // Check if we have Stream mode data for this table range
+        // Find TableRegion that matches this line range by comparing y-coordinates
+        let stream_region = self.stream_table_regions.iter().find(|region| {
+            // Get y-coordinates of start and end lines
+            if start >= self.assembled_lines.len() || end >= self.assembled_lines.len() {
+                return false;
+            }
+            let start_y = self.assembled_lines[start].y;
+            let end_y = self.assembled_lines[end].y;
+
+            // Check if this region's bbox encompasses these lines
+            region.bbox.y_min <= start_y.max(end_y) && region.bbox.y_max >= start_y.min(end_y)
+        });
+
+        if let Some(region) = stream_region {
+            // Use Stream mode structured cell data
+            log::debug!("Using Stream mode structured cells for table (lines {} to {})", start, end);
+
+            let rows: Vec<TableRow> = region.cells.iter().map(|row_cells| {
+                TableRow {
+                    cells: row_cells.iter().map(|cell| cell.content.clone()).collect(),
+                    y: row_cells.first().map(|c| c.bbox.y_min).unwrap_or(0.0),
+                }
+            }).collect();
+
+            // Detect header row (first row that's bold or all caps)
+            let header_row_index = (start..=end).position(|idx| {
+                let line = &self.assembled_lines[idx];
+                line.dominant_style.is_bold || self.is_line_all_caps(line)
+            });
+
+            Block::Table {
+                rows,
+                column_positions: region.columns.clone(),
+                header_row_index,
+            }
+        } else {
+            // Fall back to legacy algorithm
+            log::debug!("Using legacy algorithm for table (lines {} to {})", start, end);
+
+            // Collect all X positions to determine final columns
+            let mut all_x_positions = Vec::new();
+            for i in start..=end {
+                for run in &self.assembled_lines[i].runs {
+                    all_x_positions.push(run.x);
+                }
+            }
+
+            let columns = self.cluster_columns(&all_x_positions);
+            let mut rows = Vec::new();
+
+            // Extract cells for each row
+            for i in start..=end {
+                let line = &self.assembled_lines[i];
+                let cells = self.extract_row_cells(line, &columns);
+                rows.push(TableRow {
+                    cells,
+                    y: line.y,
+                });
+            }
+
+            // Detect header row (first row that's bold or all caps)
+            let header_row_index = (start..=end).position(|idx| {
+                let line = &self.assembled_lines[idx];
+                line.dominant_style.is_bold || self.is_line_all_caps(line)
+            });
+
+            Block::Table {
+                rows,
+                column_positions: columns,
+                header_row_index,
+            }
+        }
+    }
+
+    /// Extract cell content for each column in a row
+    fn extract_row_cells(&self, line: &TextLine, columns: &[f64]) -> Vec<String> {
+        let tolerance = self.config.table_column_tolerance;
+        let mut cells = vec![String::new(); columns.len()];
+
+        for run in &line.runs {
+            // Find which column this run belongs to
+            if let Some(col_idx) = columns.iter().position(|&col_x| {
+                (run.x - col_x).abs() <= tolerance
+            }) {
+                if !cells[col_idx].is_empty() {
+                    cells[col_idx].push(' ');
+                }
+                cells[col_idx].push_str(&run.text);
+            }
+        }
+
+        cells
+    }
+
+    /// Analyze assembled lines and create blocks
+    fn analyze_blocks(&mut self) {
+        if self.assembled_lines.is_empty() {
+            return;
+        }
+
+        // First pass: calculate statistics
+        self.calculate_statistics();
+
+        let mut blocks = Vec::new();
+
+        // Detect table regions based on detection mode
+        let table_regions = if self.config.enable_table_detection {
+            match self.config.table_detection_mode {
+                TableDetectionMode::Disabled => {
+                    log::debug!("Table detection disabled");
+                    Vec::new()
+                }
+                TableDetectionMode::Legacy => {
+                    log::debug!("Using legacy table detection");
+                    self.detect_table_regions_legacy()
+                }
+                TableDetectionMode::StreamMode => {
+                    log::debug!("Using Stream mode table detection");
+                    self.detect_table_regions_stream()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Mark which lines are part of tables
+        let mut in_table = vec![false; self.assembled_lines.len()];
+        for (start, end) in &table_regions {
+            for i in *start..=*end {
+                in_table[i] = true;
+            }
+        }
+
+        let mut current_paragraph_lines: Vec<String> = Vec::new();
+        let mut last_y = self.assembled_lines[0].y;
+        let mut last_indent = self.assembled_lines[0].x_start;
+        let mut i = 0;
+
+        while i < self.assembled_lines.len() {
+            // If this line starts a table, extract the table and skip to after it
+            if in_table[i] {
+                // Flush any current paragraph
+                if !current_paragraph_lines.is_empty() {
+                    blocks.push(Block::Paragraph {
+                        lines: std::mem::take(&mut current_paragraph_lines),
+                        indentation: last_indent,
+                    });
+                }
+
+                // Find the table region containing this line
+                if let Some(&(start, end)) = table_regions.iter().find(|(s, _)| *s == i) {
+                    let table = self.extract_table(start, end);
+                    blocks.push(table);
+                    i = end + 1;
+
+                    // Update tracking variables if there are more lines
+                    if i < self.assembled_lines.len() {
+                        last_y = self.assembled_lines[i].y;
+                        last_indent = self.assembled_lines[i].x_start;
+                    }
+                    continue;
+                } else {
+                    // Shouldn't happen, but skip this line if we can't find the region
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Normal line processing (headings, lists, paragraphs)
+            let line = &self.assembled_lines[i];
+            let y_gap = (line.y - last_y).abs();
+            let is_large_gap = y_gap > line.avg_font_size * self.config.paragraph_spacing_threshold;
+            let indent_changed = (line.x_start - last_indent).abs() > self.config.list_indent_threshold;
+
+            // Check for heading
+            if let Some(level) = self.detect_heading(line, i) {
+                // Flush current paragraph
+                if !current_paragraph_lines.is_empty() {
+                    blocks.push(Block::Paragraph {
+                        lines: std::mem::take(&mut current_paragraph_lines),
+                        indentation: last_indent,
+                    });
+                }
+
+                blocks.push(Block::Heading {
+                    level,
+                    text: self.line_to_markdown(line),
+                });
+
+                last_y = line.y;
+                last_indent = line.x_start;
+                i += 1;
+                continue;
+            }
+
+            // Check for list item
+            if let Some((bullet_type, nest_level)) = self.detect_list_item(line) {
+                // Flush paragraph
+                if !current_paragraph_lines.is_empty() {
+                    blocks.push(Block::Paragraph {
+                        lines: std::mem::take(&mut current_paragraph_lines),
+                        indentation: last_indent,
+                    });
+                }
+
+                blocks.push(Block::ListItem {
+                    bullet_type,
+                    indentation: line.x_start,
+                    content: self.line_to_markdown(line),
+                    nested_level: nest_level,
+                });
+
+                last_y = line.y;
+                last_indent = line.x_start;
+                i += 1;
+                continue;
+            }
+
+            // Check for paragraph break
+            if is_large_gap || indent_changed {
+                if !current_paragraph_lines.is_empty() {
+                    blocks.push(Block::Paragraph {
+                        lines: std::mem::take(&mut current_paragraph_lines),
+                        indentation: last_indent,
+                    });
+                }
+                last_indent = line.x_start;
+            }
+
+            // Accumulate into current paragraph
+            current_paragraph_lines.push(self.line_to_markdown(line));
+            last_y = line.y;
+            i += 1;
+        }
+
+        // Flush final paragraph
+        if !current_paragraph_lines.is_empty() {
+            blocks.push(Block::Paragraph {
+                lines: current_paragraph_lines,
+                indentation: last_indent,
+            });
+        }
+
+        // Second pass: detect code blocks if enabled
+        if self.config.detect_code_blocks {
+            self.blocks = self.detect_code_blocks_in_blocks(blocks);
+        } else {
+            self.blocks = blocks;
+        }
+    }
+
+    /// Post-process blocks to detect code blocks
+    fn detect_code_blocks_in_blocks(&self, blocks: Vec<Block>) -> Vec<Block> {
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < blocks.len() {
+            // Check if this is a paragraph with monospace font
+            if let Block::Paragraph { ref lines, .. } = blocks[i] {
+                // Count consecutive monospace paragraphs
+                let mut mono_count = 0;
+                let mut mono_lines = Vec::new();
+
+                let mut j = i;
+                while j < blocks.len() {
+                    if let Block::Paragraph { ref lines, .. } = blocks[j] {
+                        // Check if all lines in this paragraph look like code
+                        let all_mono = lines.iter().all(|line| {
+                            // Simple heuristic: contains backticks or looks like code
+                            line.starts_with("    ") || line.contains("`")
+                        });
+
+                        if all_mono || mono_count > 0 {
+                            mono_lines.extend(lines.clone());
+                            mono_count += 1;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // If we found enough consecutive blocks, make it a code block
+                if mono_count >= self.config.min_code_block_lines {
+                    result.push(Block::CodeBlock {
+                        lines: mono_lines,
+                    });
+                    i = j;
+                    continue;
+                }
+            }
+
+            // Not a code block, add as-is
+            result.push(blocks[i].clone());
+            i += 1;
+        }
+
+        result
+    }
+
+    /// Write accumulated blocks as markdown
+    fn write_markdown(&mut self) -> Result<(), OutputError> {
+        use std::fmt::Write;
+
+        for (idx, block) in self.blocks.iter().enumerate() {
+            match block {
+                Block::Heading { level, text } => {
+                    let prefix = "#".repeat(*level as usize);
+                    writeln!(self.writer, "{} {}", prefix, text)?;
+                    writeln!(self.writer)?;  // Blank line after heading
+                }
+
+                Block::Paragraph { lines, .. } => {
+                    let paragraph = lines.join(" ");
+                    writeln!(self.writer, "{}", paragraph)?;
+                    writeln!(self.writer)?;  // Blank line after paragraph
+                }
+
+                Block::ListItem { bullet_type, content, nested_level, .. } => {
+                    let indent = "  ".repeat(*nested_level);
+                    let marker = match bullet_type {
+                        BulletType::Unordered => "-",
+                        BulletType::Ordered => "1.",  // Could track counter
+                    };
+                    writeln!(self.writer, "{}{} {}", indent, marker, content)?;
+
+                    // Don't add blank line between list items of same level
+                    if let Some(next) = self.blocks.get(idx + 1) {
+                        if !matches!(next, Block::ListItem { .. }) {
+                            writeln!(self.writer)?;
+                        }
+                    }
+                }
+
+                Block::CodeBlock { lines } => {
+                    writeln!(self.writer, "```")?;
+                    for line in lines {
+                        writeln!(self.writer, "{}", line)?;
+                    }
+                    writeln!(self.writer, "```")?;
+                    writeln!(self.writer)?;
+                }
+
+                Block::Table { rows, header_row_index, .. } => {
+                    // Markdown table format
+                    if rows.is_empty() {
+                        continue;
+                    }
+
+                    // Write header row (if detected) or first row
+                    let header_idx = header_row_index.unwrap_or(0);
+                    write!(self.writer, "|")?;
+                    for cell in &rows[header_idx].cells {
+                        write!(self.writer, " {} |", cell.trim())?;
+                    }
+                    writeln!(self.writer)?;
+
+                    // Write separator
+                    write!(self.writer, "|")?;
+                    for _ in 0..rows[header_idx].cells.len() {
+                        write!(self.writer, " --- |")?;
+                    }
+                    writeln!(self.writer)?;
+
+                    // Write data rows
+                    let start_row = if header_row_index.is_some() { header_idx + 1 } else { 1 };
+                    for row in &rows[start_row..] {
+                        write!(self.writer, "|")?;
+                        for cell in &row.cells {
+                            write!(self.writer, " {} |", cell.trim())?;
+                        }
+                        writeln!(self.writer)?;
+                    }
+
+                    writeln!(self.writer)?; // Blank line after table
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Implement OutputDev trait
+impl<W: ConvertToFmt> OutputDev for MarkdownOutput<W> {
+    fn begin_page(&mut self, page_num: u32, media_box: &MediaBox, _art_box: Option<(f64, f64, f64, f64)>)
+        -> Result<(), OutputError>
+    {
+        self.current_page = page_num;
+        self.flip_ctm = Transform2D::row_major(1., 0., 0., -1., 0., media_box.ury - media_box.lly);
+
+        // Reset page-level state
+        self.run_buffer.clear();
+        self.assembled_lines.clear();
+        self.blocks.clear();
+        self.stats = PageStatistics::default();
+        self.char_counter = 0;
+        self.current_run_text.clear();
+        self.last_x = 0.0;
+        self.last_y = 0.0;
+        self.run_start_x = 0.0;
+        self.run_start_y = 0.0;
+
+        Ok(())
+    }
+
+    fn end_page(&mut self) -> Result<(), OutputError> {
+        // Flush any remaining run
+        self.flush_current_run();
+
+        // Process accumulated runs into lines
+        self.assemble_lines();
+
+        // Analyze lines into blocks
+        self.analyze_blocks();
+
+        // Generate markdown output
+        self.write_markdown()?;
+
+        Ok(())
+    }
+
+    fn output_character(&mut self, trm: &Transform, width: f64, _spacing: f64,
+                       font_size: f64, char: &str) -> Result<(), OutputError>
+    {
+        let position = trm.post_transform(&self.flip_ctm);
+        let transformed_font_size_vec = trm.transform_vector(vec2(font_size, font_size));
+        let transformed_font_size = (transformed_font_size_vec.x * transformed_font_size_vec.y).sqrt();
+        let (x, y) = (position.m31, position.m32);
+
+        // Check if we should start a new run
+        let should_split = self.should_start_new_run(x, y, transformed_font_size);
+
+        if should_split {
+            self.flush_current_run();
+            self.last_x = x;
+            self.last_y = y;
+            self.run_start_x = x;  // Capture START of new run
+            self.run_start_y = y;
+            self.current_font_size = transformed_font_size;
+        }
+
+        // First character of a run - capture start position
+        if self.current_run_text.is_empty() {
+            self.run_start_x = x;
+            self.run_start_y = y;
+        }
+
+        // Accumulate character
+        self.current_run_text.push_str(char);
+        self.last_x = x + width * transformed_font_size;
+        self.char_counter += 1;
+
+        Ok(())
+    }
+
+    fn begin_word(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+
+    fn end_word(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> Result<(), OutputError> {
+        self.flush_current_run();
+        Ok(())
+    }
+
+    fn set_font(&mut self, font_name: &str) -> Result<(), OutputError> {
+        self.current_font_style = FontStyle::from_font_name(font_name);
+        Ok(())
+    }
+}
+
 
 pub fn print_metadata(doc: &Document) {
     dlog!("Version: {}", doc.version);
@@ -2376,6 +4888,71 @@ pub fn extract_text_from_mem_by_pages_encrypted(buffer: &[u8], password: &str) -
         }
     }
     Ok(v)
+}
+
+// ==================== Markdown Extraction Public API ====================
+
+/// Extract markdown from a PDF file
+///
+/// This function extracts text from a PDF file and formats it as markdown,
+/// preserving document structure (headings, lists, emphasis, etc.) for optimal
+/// LLM consumption.
+///
+/// # Arguments
+///
+/// * `path` - Path to the PDF file
+///
+/// # Returns
+///
+/// * `Result<String, OutputError>` - The extracted markdown content
+///
+/// # Example
+///
+/// ```no_run
+/// use pdf_extract::extract_markdown;
+///
+/// let markdown = extract_markdown("document.pdf").expect("Failed to extract markdown");
+/// println!("{}", markdown);
+/// ```
+pub fn extract_markdown<P: std::convert::AsRef<std::path::Path>>(path: P) -> Result<String, OutputError> {
+    extract_markdown_with_config(path, MarkdownConfig::default())
+}
+
+/// Extract markdown from a PDF file with custom configuration
+///
+/// This function extracts text from a PDF file and formats it as markdown,
+/// using custom configuration for heuristic detection thresholds.
+///
+/// # Arguments
+///
+/// * `path` - Path to the PDF file
+/// * `config` - Configuration for markdown extraction heuristics
+///
+/// # Returns
+///
+/// * `Result<String, OutputError>` - The extracted markdown content
+///
+/// # Example
+///
+/// ```no_run
+/// use pdf_extract::{extract_markdown_with_config, MarkdownConfig};
+///
+/// let config = MarkdownConfig {
+///     max_heading_level: 4,
+///     ..Default::default()
+/// };
+/// let markdown = extract_markdown_with_config("document.pdf", config)
+///     .expect("Failed to extract markdown");
+/// ```
+pub fn extract_markdown_with_config<P: std::convert::AsRef<std::path::Path>>(
+    path: P,
+    config: MarkdownConfig
+) -> Result<String, OutputError> {
+    let doc = Document::load(path)?;
+    let mut output_string = String::new();
+    let mut md_output = MarkdownOutput::with_config(&mut output_string, config);
+    output_doc(&doc, &mut md_output)?;
+    Ok(output_string)
 }
 
 

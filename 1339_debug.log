@@ -1,0 +1,339 @@
+warning: private item shadows public glob re-export
+  --> src/lib.rs:25:5
+   |
+25 | use std::result::Result;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+note: the name `Result` in the type namespace is supposed to be publicly re-exported here
+  --> src/lib.rs:6:9
+   |
+ 6 | pub use lopdf::*;
+   |         ^^^^^^^^
+note: but the private item here shadows it
+  --> src/lib.rs:25:5
+   |
+25 | use std::result::Result;
+   |     ^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(hidden_glob_reexports)]` on by default
+
+warning: unused variable: `e`
+   --> src/lib.rs:511:65
+    |
+511 | ...                   Entry::Occupied(e) => {
+    |                                       ^ help: if this is intentional, prefix it with an underscore: `_e`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `name`
+   --> src/lib.rs:583:17
+    |
+583 |             let name = if is_core_font(&base_name) {
+    |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `col_center`
+    --> src/lib.rs:3077:21
+     |
+3077 |                 let col_center = (col_x_min + col_x_max) / 2.0;
+     |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_col_center`
+
+warning: unused variable: `lines`
+    --> src/lib.rs:4509:39
+     |
+4509 |             if let Block::Paragraph { ref lines, .. } = blocks[i] {
+     |                                       ^^^^^^^^^ help: try ignoring the field: `lines: _`
+
+warning: field `doc` is never read
+   --> src/lib.rs:315:5
+    |
+313 | struct PdfType3Font<'a> {
+    |        ------------ field in this struct
+314 |     font: &'a Dictionary,
+315 |     doc: &'a Document,
+    |     ^^^
+    |
+    = note: `PdfType3Font` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `contents`, `size`, `bits_per_sample`, `encode`, and `decode` are never read
+    --> src/lib.rs:1153:5
+     |
+1150 | struct Type0Func {
+     |        --------- fields in this struct
+...
+1153 |     contents: Vec<u8>,
+     |     ^^^^^^^^
+1154 |     size: Vec<i64>,
+     |     ^^^^
+1155 |     bits_per_sample: i64,
+     |     ^^^^^^^^^^^^^^^
+1156 |     encode: Vec<f64>,
+     |     ^^^^^^
+1157 |     decode: Vec<f64>,
+     |     ^^^^^^
+     |
+     = note: `Type0Func` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `c0`, `c1`, and `n` are never read
+    --> src/lib.rs:1183:5
+     |
+1182 | struct Type2Func {
+     |        --------- fields in this struct
+1183 |     c0: Option<Vec<f64>>,
+     |     ^^
+1184 |     c1: Option<Vec<f64>>,
+     |     ^^
+1185 |     n: f64,
+     |     ^
+     |
+     = note: `Type2Func` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `0` is never read
+    --> src/lib.rs:1190:11
+     |
+1190 |     Type0(Type0Func),
+     |     ----- ^^^^^^^^^
+     |     |
+     |     field in this variant
+     |
+     = note: `Function` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+     |
+1190 -     Type0(Type0Func),
+1190 +     Type0(()),
+     |
+
+warning: field `0` is never read
+    --> src/lib.rs:1191:11
+     |
+1191 |     Type2(Type2Func),
+     |     ----- ^^^^^^^^^
+     |     |
+     |     field in this variant
+     |
+     = note: `Function` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+     |
+1191 -     Type2(Type2Func),
+1191 +     Type2(()),
+     |
+
+warning: fields `white_point`, `black_point`, and `gamma` are never read
+    --> src/lib.rs:1427:5
+     |
+1426 | pub struct CalGray {
+     |            ------- fields in this struct
+1427 |     white_point: [f64; 3],
+     |     ^^^^^^^^^^^
+1428 |     black_point: Option<[f64; 3]>,
+     |     ^^^^^^^^^^^
+1429 |     gamma: Option<f64>,
+     |     ^^^^^
+     |
+     = note: `CalGray` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `white_point`, `black_point`, `gamma`, and `matrix` are never read
+    --> src/lib.rs:1434:5
+     |
+1433 | pub struct CalRGB {
+     |            ------ fields in this struct
+1434 |     white_point: [f64; 3],
+     |     ^^^^^^^^^^^
+1435 |     black_point: Option<[f64; 3]>,
+     |     ^^^^^^^^^^^
+1436 |     gamma: Option<[f64; 3]>,
+     |     ^^^^^
+1437 |     matrix: Option<Vec<f64>>
+     |     ^^^^^^
+     |
+     = note: `CalRGB` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `white_point`, `black_point`, and `range` are never read
+    --> src/lib.rs:1442:5
+     |
+1441 | pub struct Lab {
+     |            --- fields in this struct
+1442 |     white_point: [f64; 3],
+     |     ^^^^^^^^^^^
+1443 |     black_point: Option<[f64; 3]>,
+     |     ^^^^^^^^^^^
+1444 |     range: Option<[f64; 4]>,
+     |     ^^^^^
+     |
+     = note: `Lab` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `name`, `alternate_space`, and `tint_transform` are never read
+    --> src/lib.rs:1460:5
+     |
+1459 | pub struct Separation {
+     |            ---------- fields in this struct
+1460 |     name: String,
+     |     ^^^^
+1461 |     alternate_space: AlternateColorSpace,
+     |     ^^^^^^^^^^^^^^^
+1462 |     tint_transform: Box<Function>,
+     |     ^^^^^^^^^^^^^^
+     |
+     = note: `Separation` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `y` is never read
+    --> src/lib.rs:2393:5
+     |
+2391 | struct TableRow {
+     |        -------- field in this struct
+2392 |     cells: Vec<String>,
+2393 |     y: f64,
+     |     ^
+     |
+     = note: `TableRow` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `indentation` is never read
+    --> src/lib.rs:2405:9
+     |
+2403 |     Paragraph {
+     |     --------- field in this variant
+2404 |         lines: Vec<String>,
+2405 |         indentation: f64,
+     |         ^^^^^^^^^^^
+     |
+     = note: `Block` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `indentation` is never read
+    --> src/lib.rs:2409:9
+     |
+2407 |     ListItem {
+     |     -------- field in this variant
+2408 |         bullet_type: BulletType,
+2409 |         indentation: f64,
+     |         ^^^^^^^^^^^
+     |
+     = note: `Block` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `column_positions` is never read
+    --> src/lib.rs:2418:9
+     |
+2416 |     Table {
+     |     ----- field in this variant
+2417 |         rows: Vec<TableRow>,
+2418 |         column_positions: Vec<f64>,
+     |         ^^^^^^^^^^^^^^^^
+     |
+     = note: `Block` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `refine_columns_with_mode` is never used
+    --> src/lib.rs:3197:8
+     |
+2711 | impl<'a> StreamTableDetector<'a> {
+     | -------------------------------- method in this implementation
+...
+3197 |     fn refine_columns_with_mode(&self, rows: &[TextRow]) -> Vec<f64> {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> src/lib.rs:682:23
+    |
+682 |     fn get_descriptor(&self) -> Option<PdfFontDescriptor> {
+    |                       ^^^^^            ^^^^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                       |
+    |                       the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+682 |     fn get_descriptor(&self) -> Option<PdfFontDescriptor<'_>> {
+    |                                                         ++++
+
+warning: hiding a lifetime that's named elsewhere is confusing
+   --> src/lib.rs:792:49
+    |
+792 |     fn char_codes(&'a self, chars: &'a [u8]) -> PdfFontIter {
+    |                    --               --          ^^^^^^^^^^^ the same lifetime is hidden here
+    |                    |                |
+    |                    |                the lifetime is named here
+    |                    the lifetime is named here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: consistently use `'a`
+    |
+792 |     fn char_codes(&'a self, chars: &'a [u8]) -> PdfFontIter<'a> {
+    |                                                            ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> src/lib.rs:1961:22
+     |
+1961 |     pub fn new(file: &mut dyn std::io::Write) -> HTMLOutput {
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^     ^^^^^^^^^^ the same lifetime is hidden here
+     |                      |
+     |                      the lifetime is elided here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+1961 |     pub fn new(file: &mut dyn std::io::Write) -> HTMLOutput<'_> {
+     |                                                            ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+    --> src/lib.rs:2039:22
+     |
+2039 |     pub fn new(file: &mut dyn std::io::Write) -> SVGOutput {
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^     ^^^^^^^^^ the same lifetime is hidden here
+     |                      |
+     |                      the lifetime is elided here
+     |
+     = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+     |
+2039 |     pub fn new(file: &mut dyn std::io::Write) -> SVGOutput<'_> {
+     |                                                           ++++
+
+warning: constant `names` should have an upper case name
+ --> src/glyphnames.rs:7:11
+  |
+7 |     const names: [(&'static str, u16); 4700] = [
+  |           ^^^^^
+  |
+  = note: `#[warn(non_upper_case_globals)]` (part of `#[warn(nonstandard_style)]`) on by default
+help: convert the identifier to upper case
+  |
+7 -     const names: [(&'static str, u16); 4700] = [
+7 +     const NAMES: [(&'static str, u16); 4700] = [
+  |
+
+warning: `pdf-extract` (lib) generated 24 warnings (run `cargo fix --lib -p pdf-extract` to apply 9 suggestions)
+   Compiling pdf-extract v0.10.0 (/home/guillaume/Work/tries/2025-12-20-pdf-extraction/pdf-extract)
+warning: unused import: `lopdf::*`
+  --> examples/extract.rs:10:5
+   |
+10 | use lopdf::*;
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused `Result` that must be used
+  --> examples/extract.rs:41:9
+   |
+41 |         doc.decrypt("");
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+   = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+41 |         let _ = doc.decrypt("");
+   |         +++++++
+
+warning: unused `Result` that must be used
+  --> examples/extract.rs:44:5
+   |
+44 |     output_doc(&doc, output.as_mut());
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+   |
+44 |     let _ = output_doc(&doc, output.as_mut());
+   |     +++++++
+
+warning: `pdf-extract` (example "extract") generated 3 warnings (run `cargo fix --example "extract" -p pdf-extract` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.61s
+     Running `target/debug/examples/extract /home/guillaume/Downloads/1339.PDF`
