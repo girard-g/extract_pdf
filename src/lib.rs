@@ -283,10 +283,13 @@ fn maybe_get<'a, T: FromObj<'a>>(doc: &'a Document, dict: &'a Dictionary, key: &
 }
 
 fn get_name_string<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> String {
-    pdf_to_utf8(dict.get(key).map(|o| maybe_deref(doc, o)).unwrap_or_else(|_| panic!("deref")).as_name().expect("name"))
+    maybe_get_name_string(doc, dict, key).unwrap_or_else(|| {
+        warn!("Missing or invalid name field '{}' in dictionary, using empty string",
+              String::from_utf8_lossy(key));
+        String::new()
+    })
 }
 
-#[allow(dead_code)]
 fn maybe_get_name_string<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> Option<String> {
     maybe_get_obj(doc, dict, key).and_then(|n| n.as_name().ok()).map(|n| pdf_to_utf8(n))
 }
@@ -374,6 +377,9 @@ impl<'a> PdfSimpleFont<'a> {
     fn new(doc: &'a Document, font: &'a Dictionary) -> PdfSimpleFont<'a> {
         let base_name = get_name_string(doc, font, b"BaseFont");
         let subtype = get_name_string(doc, font, b"Subtype");
+        if base_name.is_empty() {
+            warn!("Font dictionary missing BaseFont field, font metrics may be inaccurate");
+        }
 
         let encoding: Option<&Object> = get(doc, font, b"Encoding");
         dlog!("base_name {} {} enc:{:?} {:?}", base_name, subtype, encoding, font);
