@@ -1362,7 +1362,24 @@ fn show_text(gs: &mut GraphicsState, s: &[u8],
         let is_space = c == 32 && length == 1;
         if is_space { spacing += ts.word_spacing }
 
-        output.output_character(&trm, w0, spacing, ts.font_size, &font.decode_char(c))?;
+        // Try to decode the character, with fallback for unmapped codes
+        let decoded = font.decode_char(c);
+        let char_str = if decoded.is_empty() {
+            // Fallback: try to interpret the character code directly as Unicode
+            if c <= 127 {
+                // ASCII range - try as Unicode codepoint
+                char::from_u32(c).map(|ch| ch.to_string()).unwrap_or_else(|| format!("[{}]", c))
+            } else if c <= 0x10FFFF {
+                // Try as Unicode codepoint
+                char::from_u32(c).map(|ch| ch.to_string()).unwrap_or_else(|| format!("[U+{:04X}]", c))
+            } else {
+                // Invalid Unicode, use hex notation
+                format!("[0x{:X}]", c)
+            }
+        } else {
+            decoded
+        };
+        output.output_character(&trm, w0, spacing, ts.font_size, &char_str)?;
         let tj = 0.;
         let ty = 0.;
         let tx = ts.horizontal_scaling * ((w0 - tj/1000.)* ts.font_size + spacing);
@@ -1836,6 +1853,44 @@ impl<'a> Processor<'a> {
                     dlog!("T* matrix {:?}", gs.ts.tm);
                     output.end_line()?;
                 }
+                "'" => {
+                    // ' operator: Move to next line and show text (T* followed by Tj)
+                    // First, do T*
+                    let tx = 0.0;
+                    let ty = -gs.ts.leading;
+                    tlm = tlm.pre_transform(&Transform2D::create_translation(tx, ty));
+                    gs.ts.tm = tlm;
+                    output.end_line()?;
+
+                    // Then show the text
+                    match operation.operands[0] {
+                        Object::String(ref s, _) => {
+                            show_text(&mut gs, s, &tlm, &flip_ctm, output)?;
+                        }
+                        _ => { panic!("unexpected ' operand {:?}", operation) }
+                    }
+                }
+                "\"" => {
+                    // " operator: Set word/character spacing, move to next line, show text
+                    // aw ac string "
+                    gs.ts.word_spacing = as_num(&operation.operands[0]);
+                    gs.ts.character_spacing = as_num(&operation.operands[1]);
+
+                    // Do T*
+                    let tx = 0.0;
+                    let ty = -gs.ts.leading;
+                    tlm = tlm.pre_transform(&Transform2D::create_translation(tx, ty));
+                    gs.ts.tm = tlm;
+                    output.end_line()?;
+
+                    // Show the text
+                    match operation.operands[2] {
+                        Object::String(ref s, _) => {
+                            show_text(&mut gs, s, &tlm, &flip_ctm, output)?;
+                        }
+                        _ => { panic!("unexpected \" operand {:?}", operation) }
+                    }
+                }
                 "q" => { gs_stack.push(gs.clone()); }
                 "Q" => {
                     let s = gs_stack.pop();
@@ -1947,6 +2002,195 @@ pub trait OutputDev {
         Ok(())
     }
 }
+
+// ==================== Glyph-Based Fallback Extraction ====================
+
+/// Captured glyph with position and metadata
+#[derive(Debug, Clone)]
+struct Glyph {
+    x: f64,
+    y: f64,
+    char_str: String,
+    font_size: f64,
+}
+
+/// Line of text reconstructed from glyphs (for fallback extraction)
+#[derive(Debug)]
+struct GlyphLine {
+    y: f64,
+    glyphs: Vec<Glyph>,
+}
+
+/// OutputDev that collects glyphs with coordinates for fallback extraction
+struct GlyphCollectorOutput {
+    glyphs: Vec<Glyph>,
+    flip_ctm: Transform,
+}
+
+impl GlyphCollectorOutput {
+    fn new() -> Self {
+        GlyphCollectorOutput {
+            glyphs: Vec::new(),
+            flip_ctm: Transform2D::identity(),
+        }
+    }
+}
+
+impl OutputDev for GlyphCollectorOutput {
+    fn begin_page(&mut self, _page_num: u32, media_box: &MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), OutputError> {
+        // Same flip_ctm calculation as PlainTextOutput
+        self.flip_ctm = Transform2D::row_major(1., 0., 0., -1., 0., media_box.ury - media_box.lly);
+        Ok(())
+    }
+
+    fn end_page(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+
+    fn output_character(&mut self, trm: &Transform, _width: f64, _spacing: f64, font_size: f64, char: &str) -> Result<(), OutputError> {
+        // Log what we receive for debugging
+        debug!("GlyphCollector: output_character called with char='{}' (len={}, empty={})",
+               char, char.len(), char.is_empty());
+
+        // Skip empty characters (from failed decode_char)
+        if char.is_empty() {
+            return Ok(());
+        }
+
+        // Apply coordinate transformation (same as PlainTextOutput)
+        let position = trm.post_transform(&self.flip_ctm);
+
+        self.glyphs.push(Glyph {
+            x: position.m31,
+            y: position.m32,
+            char_str: char.to_string(),
+            font_size,
+        });
+        Ok(())
+    }
+
+    fn begin_word(&mut self) -> Result<(), OutputError> { Ok(()) }
+    fn end_word(&mut self) -> Result<(), OutputError> { Ok(()) }
+    fn end_line(&mut self) -> Result<(), OutputError> { Ok(()) }
+}
+
+/// Cluster glyphs into lines based on Y-coordinate proximity
+fn cluster_into_lines(mut glyphs: Vec<Glyph>) -> Vec<GlyphLine> {
+    const Y_TOLERANCE_FACTOR: f64 = 0.5;
+
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort by Y to enable efficient clustering
+    glyphs.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut lines: Vec<GlyphLine> = Vec::new();
+
+    for glyph in glyphs {
+        let threshold = glyph.font_size * Y_TOLERANCE_FACTOR;
+
+        // Find existing line within Y tolerance
+        if let Some(line) = lines.iter_mut().find(|line| (line.y - glyph.y).abs() < threshold) {
+            line.glyphs.push(glyph);
+            // Update line Y to average
+            line.y = line.glyphs.iter().map(|g| g.y).sum::<f64>() / line.glyphs.len() as f64;
+        } else {
+            // Create new line
+            lines.push(GlyphLine {
+                y: glyph.y,
+                glyphs: vec![glyph],
+            });
+        }
+    }
+
+    lines
+}
+
+/// Build text from a line of glyphs, inserting spaces based on X gaps
+fn build_line_text(line: &GlyphLine) -> String {
+    const SPACE_GAP_FACTOR: f64 = 0.3;
+
+    if line.glyphs.is_empty() {
+        return String::new();
+    }
+
+    // Sort glyphs left-to-right
+    let mut sorted = line.glyphs.clone();
+    sorted.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut result = String::new();
+    let mut prev_x_end: Option<f64> = None;
+
+    for glyph in sorted {
+        if let Some(prev_end) = prev_x_end {
+            let gap = glyph.x - prev_end;
+            let space_threshold = glyph.font_size * SPACE_GAP_FACTOR;
+
+            if gap > space_threshold {
+                result.push(' ');
+            }
+        }
+
+        result.push_str(&glyph.char_str);
+
+        // Estimate character width (conservative: 0.5 * font_size)
+        prev_x_end = Some(glyph.x + glyph.font_size * 0.5);
+    }
+
+    result
+}
+
+/// Normalize extracted text (spacing, colons, euro symbols)
+fn normalize_text(text: String) -> String {
+    let mut result = text;
+
+    // Normalize colon spacing: "Label :" → "Label:"
+    result = result.replace(" :", ":");
+
+    // Handle euro symbol encoding issues
+    result = result.replace("â‚¬", "€");
+
+    // Trim trailing whitespace from each line
+    result = result.lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Collapse excessive blank lines (3+ → 2)
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
+/// Reconstruct text from captured glyphs
+fn reconstruct_text_from_glyphs(glyphs: Vec<Glyph>) -> String {
+    if glyphs.is_empty() {
+        return String::new();
+    }
+
+    // Cluster into lines
+    let mut lines = cluster_into_lines(glyphs);
+
+    // Sort lines top-to-bottom (higher Y first in PDF coordinates)
+    lines.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build text from lines
+    let mut result = String::new();
+    for line in lines {
+        let line_text = build_line_text(&line);
+        if !line_text.is_empty() {
+            result.push_str(&line_text);
+            result.push('\n');
+        }
+    }
+
+    normalize_text(result)
+}
+
+// ==================== End Glyph-Based Fallback Extraction ====================
 
 
 pub struct HTMLOutput<'a>  {
@@ -4763,16 +5007,45 @@ pub fn print_metadata(doc: &Document) {
     dlog!("Type: {:?}", get_pages(&doc).get(b"Type").and_then(|x| x.as_name()).unwrap());
 }
 
-/// Extract the text from a pdf at `path` and return a `String` with the results
-pub fn extract_text<P: std::convert::AsRef<std::path::Path>>(path: P) -> Result<String, OutputError> {
+/// Internal extraction with fallback for glyph-based PDFs
+fn extract_with_fallback(doc: &Document) -> Result<String, OutputError> {
+    const MIN_CHARS_THRESHOLD: usize = 10;
+
+    // Try normal extraction first
     let mut s = String::new();
     {
         let mut output = PlainTextOutput::new(&mut s);
-        let mut doc = Document::load(path)?;
-        maybe_decrypt(&mut doc)?;
-        output_doc(&doc, &mut output)?;
+        output_doc(doc, &mut output)?;
     }
-    Ok(s)
+
+    // Check if extraction was successful
+    let trimmed = s.trim();
+    if trimmed.len() >= MIN_CHARS_THRESHOLD {
+        return Ok(s);
+    }
+
+    // Fallback: glyph-based extraction
+    debug!("Normal extraction yielded {} chars, attempting glyph-based fallback", trimmed.len());
+
+    let mut collector = GlyphCollectorOutput::new();
+    output_doc(doc, &mut collector)?;
+
+    if collector.glyphs.is_empty() {
+        debug!("Fallback found no glyphs, returning original output");
+        return Ok(s);
+    }
+
+    debug!("Fallback collected {} glyphs, reconstructing text", collector.glyphs.len());
+    let reconstructed = reconstruct_text_from_glyphs(collector.glyphs);
+
+    Ok(reconstructed)
+}
+
+/// Extract the text from a pdf at `path` and return a `String` with the results
+pub fn extract_text<P: std::convert::AsRef<std::path::Path>>(path: P) -> Result<String, OutputError> {
+    let mut doc = Document::load(path)?;
+    maybe_decrypt(&mut doc)?;
+    extract_with_fallback(&doc)
 }
 
 fn maybe_decrypt(doc: &mut Document) -> Result<(), OutputError> {
@@ -4795,47 +5068,52 @@ pub fn extract_text_encrypted<P: std::convert::AsRef<std::path::Path>>(
     path: P,
     password: &str,
 ) -> Result<String, OutputError> {
-    let mut s = String::new();
-    {
-        let mut output = PlainTextOutput::new(&mut s);
-        let mut doc = Document::load(path)?;
-        output_doc_encrypted(&mut doc, &mut output, password)?;
-    }
-    Ok(s)
+    let mut doc = Document::load(path)?;
+    doc.decrypt(password)?;
+    extract_with_fallback(&doc)
 }
 
 pub fn extract_text_from_mem(buffer: &[u8]) -> Result<String, OutputError> {
-    let mut s = String::new();
-    {
-        let mut output = PlainTextOutput::new(&mut s);
-        let mut doc = Document::load_mem(buffer)?;
-        maybe_decrypt(&mut doc)?;
-        output_doc(&doc, &mut output)?;
-    }
-    Ok(s)
+    let mut doc = Document::load_mem(buffer)?;
+    maybe_decrypt(&mut doc)?;
+    extract_with_fallback(&doc)
 }
 
 pub fn extract_text_from_mem_encrypted(
     buffer: &[u8],
     password: &str,
 ) -> Result<String, OutputError> {
-    let mut s = String::new();
-    {
-        let mut output = PlainTextOutput::new(&mut s);
-        let mut doc = Document::load_mem(buffer)?;
-        output_doc_encrypted(&mut doc, &mut output, password)?;
-    }
-    Ok(s)
+    let mut doc = Document::load_mem(buffer)?;
+    doc.decrypt(password)?;
+    extract_with_fallback(&doc)
 }
 
 
 fn extract_text_by_page(doc: &Document, page_num: u32) -> Result<String, OutputError> {
+    const MIN_CHARS_THRESHOLD: usize = 10;
+
+    // Try normal extraction
     let mut s = String::new();
     {
         let mut output = PlainTextOutput::new(&mut s);
         output_doc_page(doc, &mut output, page_num)?;
     }
-    Ok(s)
+
+    // Check if fallback needed
+    if s.trim().len() >= MIN_CHARS_THRESHOLD {
+        return Ok(s);
+    }
+
+    // Fallback for this page
+    let mut collector = GlyphCollectorOutput::new();
+    output_doc_page(doc, &mut collector, page_num)?;
+
+    if collector.glyphs.is_empty() {
+        return Ok(s);
+    }
+
+    let reconstructed = reconstruct_text_from_glyphs(collector.glyphs);
+    Ok(reconstructed)
 }
 
 /// Extract the text from a pdf at `path` and return a `Vec<String>` with the results separately by page
@@ -5026,4 +5304,70 @@ fn output_doc_inner<'a>(page_num: u32, object_id: ObjectId, doc: &'a Document, p
     p.process_stream(&doc, doc.get_page_content(object_id).unwrap(), resources, &media_box, output, page_num)?;
     output.end_page()?;
     Ok(())
+}
+
+// ==================== Tests ====================
+
+#[cfg(test)]
+mod glyph_reconstruction_tests {
+    use super::*;
+
+    #[test]
+    fn test_cluster_glyphs_single_line() {
+        let glyphs = vec![
+            Glyph { x: 10.0, y: 100.0, char_str: "H".into(), font_size: 12.0 },
+            Glyph { x: 18.0, y: 100.5, char_str: "e".into(), font_size: 12.0 },
+            Glyph { x: 25.0, y: 100.2, char_str: "l".into(), font_size: 12.0 },
+            Glyph { x: 30.0, y: 99.8, char_str: "l".into(), font_size: 12.0 },
+            Glyph { x: 35.0, y: 100.1, char_str: "o".into(), font_size: 12.0 },
+        ];
+
+        let lines = cluster_into_lines(glyphs);
+        assert_eq!(lines.len(), 1, "Should cluster into single line");
+        assert_eq!(lines[0].glyphs.len(), 5);
+    }
+
+    #[test]
+    fn test_cluster_glyphs_multiple_lines() {
+        let glyphs = vec![
+            Glyph { x: 10.0, y: 100.0, char_str: "L".into(), font_size: 12.0 },
+            Glyph { x: 20.0, y: 100.0, char_str: "1".into(), font_size: 12.0 },
+            Glyph { x: 10.0, y: 85.0, char_str: "L".into(), font_size: 12.0 },
+            Glyph { x: 20.0, y: 85.0, char_str: "2".into(), font_size: 12.0 },
+        ];
+
+        let lines = cluster_into_lines(glyphs);
+        assert_eq!(lines.len(), 2, "Should cluster into two lines");
+    }
+
+    #[test]
+    fn test_build_line_with_spaces() {
+        let line = GlyphLine {
+            y: 100.0,
+            glyphs: vec![
+                Glyph { x: 10.0, y: 100.0, char_str: "Hello".into(), font_size: 12.0 },
+                Glyph { x: 50.0, y: 100.0, char_str: "World".into(), font_size: 12.0 },
+            ],
+        };
+
+        let text = build_line_text(&line);
+        assert!(text.contains(' '), "Should insert space between words");
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+    }
+
+    #[test]
+    fn test_normalize_colon_spacing() {
+        let input = "Label : Value\nAnother : Test".to_string();
+        let output = normalize_text(input);
+        assert_eq!(output, "Label: Value\nAnother: Test");
+    }
+
+    #[test]
+    fn test_normalize_euro_symbol() {
+        let input = "Price: 100 â‚¬".to_string();
+        let output = normalize_text(input);
+        assert!(output.contains("€"));
+        assert!(!output.contains("â‚¬"));
+    }
 }
