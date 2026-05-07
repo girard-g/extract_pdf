@@ -1636,6 +1636,60 @@ fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary
     }
 }
 
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, 0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ')
+}
+
+fn matches_token(content: &[u8], i: usize, token: &[u8]) -> bool {
+    if i + token.len() > content.len() || &content[i..i + token.len()] != token {
+        return false;
+    }
+    let before_ok = i == 0 || is_pdf_whitespace(content[i - 1]);
+    let after = i + token.len();
+    let after_ok = after >= content.len() || is_pdf_whitespace(content[after]);
+    before_ok && after_ok
+}
+
+fn find_inline_image_end(content: &[u8], start: usize) -> Option<usize> {
+    let mut j = start;
+    while j + 2 <= content.len() {
+        if content[j] == b'E' && content[j + 1] == b'I' {
+            let preceded = j > 0 && is_pdf_whitespace(content[j - 1]);
+            let after = j + 2;
+            let followed = after >= content.len() || is_pdf_whitespace(content[after]);
+            if preceded && followed {
+                return Some(after);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Strip inline-image (BI..EI) blocks from a PDF content stream.
+///
+/// The end of an inline image is detected by `EI` surrounded by PDF
+/// whitespace. The PDF spec mandates this surrounding whitespace, but the
+/// binary image data is undelimited, so a `<ws>EI<ws>` byte sequence inside
+/// the data would be a false match — acceptable trade-off for a fallback path.
+fn strip_inline_images(content: &[u8]) -> Vec<u8> {
+    let n = content.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        if matches_token(content, i, b"BI") {
+            if let Some(end) = find_inline_image_end(content, i + 2) {
+                out.push(b' ');
+                i = end;
+                continue;
+            }
+        }
+        out.push(content[i]);
+        i += 1;
+    }
+    out
+}
+
 struct Processor<'a> {
     _none: PhantomData<&'a ()>
 }
@@ -1646,7 +1700,17 @@ impl<'a> Processor<'a> {
     }
 
     fn process_stream(&mut self, doc: &'a Document, content: Vec<u8>, resources: &'a Dictionary, media_box: &MediaBox, output: &mut dyn OutputDev, page_num: u32) -> Result<(), OutputError> {
-        let content = Content::decode(&content).unwrap();
+        let content = match Content::decode(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                // lopdf 0.38 cannot parse inline images that have a filter
+                // (e.g. /F/Fl). Retry with inline-image blocks stripped so the
+                // surrounding text-extraction operators can still be parsed.
+                warn!("Content stream decode failed ({:?}); retrying with inline images stripped", e);
+                let stripped = strip_inline_images(&content);
+                Content::decode(&stripped)?
+            }
+        };
         let mut font_table = HashMap::new();
         let mut gs: GraphicsState = GraphicsState {
             ts: TextState {
@@ -5307,6 +5371,43 @@ fn output_doc_inner<'a>(page_num: u32, object_id: ObjectId, doc: &'a Document, p
 }
 
 // ==================== Tests ====================
+
+#[cfg(test)]
+mod inline_image_stripping_tests {
+    use super::*;
+
+    #[test]
+    fn passes_through_streams_without_inline_images() {
+        let stream = b"q 1 0 0 1 0 0 cm BT /F1 12 Tf (Hello) Tj ET Q";
+        assert_eq!(strip_inline_images(stream), stream.to_vec());
+    }
+
+    #[test]
+    fn strips_inline_image_block() {
+        let stream =
+            b"q (before) Tj\nBI\n/W 1 /H 1 /CS /RGB /BPC 8\nID \xff\xff\xff\nEI Q (after) Tj";
+        let stripped = strip_inline_images(stream);
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(s.contains("(before) Tj"));
+        assert!(s.contains("Q (after) Tj"));
+        assert!(!s.contains("BI"));
+        assert!(!s.contains("EI"));
+    }
+
+    #[test]
+    fn does_not_match_bi_inside_a_string() {
+        // "BI" is part of an operand here (no surrounding whitespace), so it
+        // must not be treated as the start of an inline image.
+        let stream = b"(BI) Tj";
+        assert_eq!(strip_inline_images(stream), stream.to_vec());
+    }
+
+    #[test]
+    fn leaves_unterminated_bi_untouched() {
+        let stream = b"q BI /W 1 /H 1";
+        assert_eq!(strip_inline_images(stream), stream.to_vec());
+    }
+}
 
 #[cfg(test)]
 mod glyph_reconstruction_tests {
