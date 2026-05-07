@@ -2501,6 +2501,7 @@ pub struct PlainTextOutput<W: ConvertToFmt>   {
     writer: W::Writer,
     last_end: f64,
     last_y: f64,
+    last_width: f64,
     first_char: bool,
     flip_ctm: Transform,
 }
@@ -2512,6 +2513,7 @@ impl<W: ConvertToFmt> PlainTextOutput<W> {
             last_end: 100000.,
             first_char: false,
             last_y: 0.,
+            last_width: 0.,
             flip_ctm: Transform2D::identity(),
         }
     }
@@ -2545,7 +2547,20 @@ impl<W: ConvertToFmt> OutputDev for PlainTextOutput<W> {
                 write!(self.writer, "\n")?;
             }
 
-            if x > self.last_end + transformed_font_size * 0.1 {
+            // Only inject an auto-space when the gap is meaningful. Two
+            // situations make `last_end` unreliable:
+            //   1. The next glyph is itself whitespace — auto-spacing would
+            //      double it up.
+            //   2. The previous glyph reported width 0 — happens with embedded
+            //      fonts whose W table is stripped, where producers position
+            //      every glyph with explicit Td. last_end then equals the
+            //      glyph's start, so any forward Td looks like a word break.
+            let next_is_whitespace = char.chars().next().is_some_and(char::is_whitespace);
+            let last_end_unreliable = self.last_width == 0.0;
+            if !next_is_whitespace
+                && !last_end_unreliable
+                && x > self.last_end + transformed_font_size * 0.1
+            {
                 dlog!("width: {}, space: {}, thresh: {}", width, x - self.last_end, transformed_font_size * 0.1);
                 write!(self.writer, " ")?;
             }
@@ -2555,6 +2570,7 @@ impl<W: ConvertToFmt> OutputDev for PlainTextOutput<W> {
         self.first_char = false;
         self.last_y = y;
         self.last_end = x + width * transformed_font_size;
+        self.last_width = width;
         Ok(())
     }
     fn begin_word(&mut self) -> Result<(), OutputError> {
