@@ -1079,7 +1079,8 @@ impl<'a> PdfCIDFont<'a> {
                     let c_first = w[i].as_i64().expect("first should be num");
                     let c_last = w[i+1].as_i64().expect("last should be num");
                     let c_width = as_num(w[i+2]);
-                    for id in c_first..=c_last {
+                    // CIDs stop at 0xFFFF; a corrupt c_last must not fill memory.
+                    for id in c_first.max(0)..=c_last.min(0xFFFF) {
                         widths.insert(id as CharCode, c_width);
                     }
                     i += 3;
@@ -5421,6 +5422,27 @@ mod cid_width_tests {
         assert_eq!(f.get_width(36), 722.);
         assert_eq!(f.get_width(38), 722.);
         assert_eq!(f.get_width(39), 500.);
+    }
+
+    #[test]
+    fn w_range_past_the_last_cid_stays_bounded() {
+        let doc = Document::with_version("1.5");
+        let font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "X",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Dictionary(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => "X",
+                "FontDescriptor" => dictionary! {},
+                "W" => vec![0.into(), i64::MAX.into(), 600.into(), 9.into(), 5.into(), 300.into()],
+            })],
+        };
+        let f = PdfCIDFont::new(&doc, &font);
+        assert_eq!(f.widths.len(), 0x10000);
+        assert_eq!(f.get_width(0xFFFF), 600.);
     }
 }
 
