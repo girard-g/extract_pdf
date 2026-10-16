@@ -1063,7 +1063,8 @@ impl<'a> PdfCIDFont<'a> {
         let mut widths = HashMap::new();
         let mut i = 0;
         if let Some(w) = w {
-            while i < w.len() {
+            // A truncated last entry is ignored: its CIDs keep the default width.
+            while i + 1 < w.len() {
                 if let &Object::Array(ref wa) = w[i+1] {
                     let cid = w[i].as_i64().expect("id should be num");
                     let mut j = 0;
@@ -1073,14 +1074,17 @@ impl<'a> PdfCIDFont<'a> {
                         j += 1;
                     }
                     i += 2;
-                } else {
+                } else if i + 2 < w.len() {
+                    // `c_first c_last w`: every CID in c_first..=c_last is w wide.
                     let c_first = w[i].as_i64().expect("first should be num");
-                    let c_last = w[i].as_i64().expect("last should be num");
-                    let c_width = as_num(&w[i]);
-                    for id in c_first..c_last {
+                    let c_last = w[i+1].as_i64().expect("last should be num");
+                    let c_width = as_num(w[i+2]);
+                    for id in c_first..=c_last {
                         widths.insert(id as CharCode, c_width);
                     }
                     i += 3;
+                } else {
+                    break;
                 }
             }
         }
@@ -5387,6 +5391,38 @@ fn output_doc_inner<'a>(page_num: u32, object_id: ObjectId, doc: &'a Document, p
 }
 
 // ==================== Tests ====================
+
+#[cfg(test)]
+mod cid_width_tests {
+    use super::*;
+    use lopdf::dictionary;
+
+    #[test]
+    fn w_reads_both_array_and_range_entries() {
+        let doc = Document::with_version("1.5");
+        let font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "X",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Dictionary(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => "X",
+                "FontDescriptor" => dictionary! {},
+                "DW" => 500,
+                // CID 3 is 250 wide; CIDs 36 to 38 are 722 wide; a truncated
+                // last entry (40 41) is ignored.
+                "W" => vec![3.into(), vec![250.into()].into(), 36.into(), 38.into(), 722.into(), 40.into(), 41.into()],
+            })],
+        };
+        let f = PdfCIDFont::new(&doc, &font);
+        assert_eq!(f.get_width(3), 250.);
+        assert_eq!(f.get_width(36), 722.);
+        assert_eq!(f.get_width(38), 722.);
+        assert_eq!(f.get_width(39), 500.);
+    }
+}
 
 #[cfg(test)]
 mod inline_image_stripping_tests {
