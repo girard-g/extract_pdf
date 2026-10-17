@@ -650,10 +650,21 @@ impl<'a> PdfSimpleFont<'a> {
             };
             for font_metrics in core_fonts::metrics().iter() {
                 if font_metrics.0 == name {
-                    if let Some(ref encoding) = encoding_table {
+                    if font_metrics.1 == "FontSpecific" && encoding_table.is_some() {
+                        // Symbol and ZapfDingbats (with a /Encoding or TrueType default) use their own built-in encoding, so the
+                        // widths are keyed by code; their glyph names ("a1", ...) are not in
+                        // the AGL and a WinAnsi/MacRoman /Encoding does not apply to them.
+                        for w in font_metrics.2 {
+                            // -1 is "not encoded"
+                            if w.0 != -1 {
+                                width_map.insert(w.0 as CharCode, w.1 as f64);
+                            }
+                        }
+                    } else if let Some(ref encoding) = encoding_table {
                         dlog!("has encoding");
                         for w in font_metrics.2 {
-                            let c = glyphnames::name_to_unicode(w.2).unwrap();
+                            // A glyph name the AGL does not know cannot match any code.
+                            let Some(c) = glyphnames::name_to_unicode(w.2) else { continue };
                             for i in 0..encoding.len() {
                                 if encoding[i] == c {
                                     width_map.insert(i as CharCode, w.1 as f64);
@@ -5593,6 +5604,45 @@ mod standard_font_substitution_tests {
         assert_eq!(width_of(&f, b'a'), 631.); // alpha
         // Even under a WinAnsi encoding the lookup must not panic on Symbol glyph names.
         let _ = width_of(&truetype("SymbolMT"), b'a');
+    }
+
+    #[test]
+    fn zapfdingbats_family_truetype_with_encoding_gets_zapf_widths() {
+        // Used to panic: the WinAnsi branch unwrapped AGL lookups of ZapfDingbats names ("a1").
+        let f = truetype("ZapfDingbatsITC");
+        assert_eq!(width_of(&f, b'a'), 789.); // a60
+        assert_eq!(width_of(&f, b'!'), 974.); // a1
+        // Same through a subset prefix.
+        assert_eq!(width_of(&truetype("ABCDEF+ZapfDingbats"), b'a'), 789.);
+    }
+
+    #[test]
+    fn symbol_truetype_with_encoding_gets_symbol_widths() {
+        assert_eq!(width_of(&truetype("SymbolMT"), b'a'), 631.); // alpha, by code
+    }
+
+    #[test]
+    fn zapfdingbatsitc_page_without_widths_still_extracts_text() {
+        use lopdf::Stream;
+        let mut doc = Document::with_version("1.5");
+        let f1 = doc.add_object(truetype("ZapfDingbatsITC"));
+        let f2 = doc.add_object(truetype("ArialMT"));
+        let contents = doc.add_object(Stream::new(dictionary! {}, b"BT /F1 12 Tf 10 100 Td (abc) Tj /F2 12 Tf 10 50 Td (Jean Dupont) Tj ET".to_vec()));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Contents" => contents,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => f1, "F2" => f2 } },
+        });
+        doc.objects.insert(pages_id, dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into());
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let text = extract_text_from_mem(&bytes).unwrap();
+        assert!(text.contains("abc"), "{:?}", text);
+        assert!(text.contains("Jean Dupont"), "{:?}", text);
     }
 
     #[test]
