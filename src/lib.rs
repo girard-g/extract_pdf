@@ -2108,6 +2108,10 @@ impl<'a> Processor<'a> {
                     let xobject: &Dictionary = get(&doc, resources, b"XObject");
                     let name = operation.operands[0].as_name().unwrap();
                     let xf: &Stream = get(&doc, xobject, name);
+                    // An image has samples, not operators; running them as a content stream panics.
+                    if maybe_get_name_string(doc, &xf.dict, b"Subtype").as_deref() == Some("Image") {
+                        continue;
+                    }
                     let resources = maybe_get_obj(&doc, &xf.dict, b"Resources").and_then(|n| n.as_dict().ok()).unwrap_or(resources);
                     let contents = get_contents(xf);
                     self.process_stream(&doc, contents, resources, &media_box, output, page_num)?;
@@ -5742,6 +5746,51 @@ mod font_restore_hook_tests {
     fn q_without_a_font_change_does_not_renotify() {
         let rec = run("BT /F1 12 Tf q (a) Tj Q (b) Tj ET");
         assert_eq!(rec.set_fonts, ["Helvetica"]);
+    }
+}
+
+#[cfg(test)]
+mod image_xobject_tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    /// One page whose `/Im1` image XObject carries `samples`, then the text "after".
+    fn page_with_image(samples: &[u8]) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let f1 = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+        let image = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+            },
+            samples.to_vec(),
+        ));
+        let resources = dictionary! {
+            "Font" => dictionary! { "F1" => f1 },
+            "XObject" => dictionary! { "Im1" => image },
+        };
+        let contents = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 10 0 0 10 0 0 cm /Im1 Do Q BT /F1 12 Tf 20 20 Td (after) Tj ET".to_vec(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Contents" => contents, "Resources" => resources,
+        });
+        doc.objects.insert(pages_id, dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into());
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn an_image_xobject_is_not_run_as_a_content_stream() {
+        let text = extract_text_from_mem(&page_with_image(b"\"")).unwrap();
+        assert!(text.contains("after"), "{text:?}");
     }
 }
 
