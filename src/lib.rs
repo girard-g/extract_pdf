@@ -1339,6 +1339,8 @@ fn as_num(o: &Object) -> f64 {
 struct TextState<'a>
 {
     font: Option<Rc<dyn PdfFont + 'a>>,
+    /// BaseFont of `font`, as announced to `OutputDev::set_font`.
+    font_name: String,
     font_size: f64,
     character_spacing: f64,
     word_spacing: f64,
@@ -1761,6 +1763,7 @@ impl<'a> Processor<'a> {
         let mut gs: GraphicsState = GraphicsState {
             ts: TextState {
                 font: None,
+                font_name: String::new(),
                 font_size: std::f64::NAN,
                 character_spacing: 0.,
                 word_spacing: 0.,
@@ -1906,6 +1909,7 @@ impl<'a> Processor<'a> {
                     // Notify output device of font change (for MarkdownOutput)
                     let base_name = get_name_string(doc, font_dict, b"BaseFont");
                     output.set_font(&base_name)?;
+                    gs.ts.font_name = base_name;
                 }
                 "Ts" => {
                     gs.ts.rise = as_num(&operation.operands[0]);
@@ -2005,7 +2009,16 @@ impl<'a> Processor<'a> {
                 "Q" => {
                     let s = gs_stack.pop();
                     if let Some(s) = s {
+                        // The output dev only hears about `Tf`, so tell it when the pop changes the font.
+                        let changed = match (&gs.ts.font, &s.ts.font) {
+                            (Some(a), Some(b)) => !Rc::ptr_eq(a, b),
+                            (None, None) => false,
+                            _ => true,
+                        };
                         gs = s;
+                        if changed && gs.ts.font.is_some() {
+                            output.set_font(&gs.ts.font_name)?;
+                        }
                     } else {
                         warn!("No state to pop");
                     }
@@ -2087,6 +2100,10 @@ impl<'a> Processor<'a> {
                     let resources = maybe_get_obj(&doc, &xf.dict, b"Resources").and_then(|n| n.as_dict().ok()).unwrap_or(resources);
                     let contents = get_contents(xf);
                     self.process_stream(&doc, contents, resources, &media_box, output, page_num)?;
+                    // The form may have selected fonts of its own; restore ours for the output dev.
+                    if gs.ts.font.is_some() {
+                        output.set_font(&gs.ts.font_name)?;
+                    }
                 }
                 _ => { dlog!("unknown operation {:?}", operation); }
 
@@ -5591,6 +5608,90 @@ mod standard_font_substitution_tests {
     fn real_standard_font_is_unchanged() {
         let f = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Times-Roman" };
         assert_eq!(width_of(&f, b'J'), 389.);
+    }
+}
+
+#[cfg(test)]
+mod font_restore_hook_tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    /// Records the `set_font` calls and the font each character was shown under.
+    #[derive(Default)]
+    struct Recorder {
+        font: String,
+        set_fonts: Vec<String>,
+        shown: Vec<(String, String)>,
+    }
+
+    impl OutputDev for Recorder {
+        fn begin_page(&mut self, _: u32, _: &MediaBox, _: Option<(f64, f64, f64, f64)>) -> Result<(), OutputError> { Ok(()) }
+        fn end_page(&mut self) -> Result<(), OutputError> { Ok(()) }
+        fn output_character(&mut self, _: &Transform, _: f64, _: f64, _: f64, c: &str) -> Result<(), OutputError> {
+            self.shown.push((self.font.clone(), c.to_owned()));
+            Ok(())
+        }
+        fn begin_word(&mut self) -> Result<(), OutputError> { Ok(()) }
+        fn end_word(&mut self) -> Result<(), OutputError> { Ok(()) }
+        fn end_line(&mut self) -> Result<(), OutputError> { Ok(()) }
+        fn set_font(&mut self, name: &str) -> Result<(), OutputError> {
+            self.font = name.to_owned();
+            self.set_fonts.push(name.to_owned());
+            Ok(())
+        }
+    }
+
+    /// One page with fonts /F1 = Helvetica, /F2 = Times-Roman and a form /Fm that
+    /// selects /F2 and shows "x".
+    fn run(content: &str) -> Recorder {
+        let mut doc = Document::with_version("1.5");
+        let font = |name: &str| dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => name };
+        let f1 = doc.add_object(font("Helvetica"));
+        let f2 = doc.add_object(font("Times-Roman"));
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F2" => f2 } },
+            },
+            b"BT /F2 12 Tf (x) Tj ET".to_vec(),
+        ));
+        let resources = dictionary! {
+            "Font" => dictionary! { "F1" => f1, "F2" => f2 },
+            "XObject" => dictionary! { "Fm" => form },
+        };
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            "Contents" => contents, "Resources" => resources,
+        });
+        doc.objects.insert(pages_id, dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into());
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut rec = Recorder::default();
+        output_doc(&doc, &mut rec).unwrap();
+        rec
+    }
+
+    #[test]
+    fn q_restores_the_font_for_the_output_dev() {
+        let rec = run("BT /F1 12 Tf q /F2 18 Tf (a) Tj Q (b) Tj ET");
+        assert_eq!(rec.set_fonts, ["Helvetica", "Times-Roman", "Helvetica"]);
+        assert_eq!(rec.shown, [("Times-Roman".to_owned(), "a".to_owned()), ("Helvetica".to_owned(), "b".to_owned())]);
+    }
+
+    #[test]
+    fn form_xobject_font_does_not_leak_to_the_caller() {
+        let rec = run("BT /F1 12 Tf ET /Fm Do BT (b) Tj ET");
+        assert_eq!(rec.set_fonts, ["Helvetica", "Times-Roman", "Helvetica"]);
+        assert_eq!(rec.shown, [("Times-Roman".to_owned(), "x".to_owned()), ("Helvetica".to_owned(), "b".to_owned())]);
+    }
+
+    #[test]
+    fn q_without_a_font_change_does_not_renotify() {
+        let rec = run("BT /F1 12 Tf q (a) Tj Q (b) Tj ET");
+        assert_eq!(rec.set_fonts, ["Helvetica"]);
     }
 }
 
