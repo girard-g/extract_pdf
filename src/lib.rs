@@ -354,6 +354,60 @@ fn is_core_font(name: &str) -> bool {
     }
 }
 
+/// Picks the standard-14 font whose metrics stand in for a simple font that has no `/Widths`.
+/// The BaseFont name decides the family (after dropping a `XXXXXX+` subset prefix and the
+/// `,` `-` `_` separators); the descriptor flags decide it when the name is unknown, with
+/// Helvetica as the last resort. Bold/italic come from the name or the descriptor.
+fn standard_font_substitute(base_name: &str, descriptor: Option<&Dictionary>) -> String {
+    let bytes = base_name.as_bytes();
+    let unprefixed = if bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(u8::is_ascii_uppercase) {
+        &base_name[7..]
+    } else {
+        base_name
+    };
+    let n: String = unprefixed.chars().filter(|c| !matches!(c, ',' | '-' | '_' | ' ')).collect::<String>().to_ascii_lowercase();
+
+    let flags = descriptor.and_then(|d| d.get(b"Flags").ok()).and_then(|o| o.as_i64().ok()).unwrap_or(0);
+    let weight = descriptor.and_then(|d| d.get(b"FontWeight").ok()).and_then(|o| o.as_float().ok()).unwrap_or(0.);
+    let angle = descriptor.and_then(|d| d.get(b"ItalicAngle").ok()).and_then(|o| o.as_float().ok()).unwrap_or(0.);
+
+    if n.starts_with("zapfdingbats") {
+        return "ZapfDingbats".to_owned();
+    }
+    if n.starts_with("symbol") {
+        return "Symbol".to_owned();
+    }
+    let family = if n.contains("courier") {
+        "Courier"
+    } else if n.contains("times") {
+        "Times"
+    } else if n.contains("arial") || n.contains("helvetica") {
+        "Helvetica"
+    } else if flags & 1 != 0 {
+        "Courier"
+    } else if flags & 2 != 0 {
+        "Times"
+    } else {
+        "Helvetica"
+    };
+    let bold = n.contains("bold") || flags & (1 << 18) != 0 || weight >= 700.;
+    let italic = n.contains("italic") || n.contains("oblique") || flags & (1 << 6) != 0 || angle != 0.;
+    match (family, bold, italic) {
+        ("Times", false, false) => "Times-Roman",
+        ("Times", true, false) => "Times-Bold",
+        ("Times", false, true) => "Times-Italic",
+        ("Times", true, true) => "Times-BoldItalic",
+        (f, false, false) => f,
+        ("Courier", true, false) => "Courier-Bold",
+        ("Courier", false, true) => "Courier-Oblique",
+        ("Courier", true, true) => "Courier-BoldOblique",
+        (_, true, false) => "Helvetica-Bold",
+        (_, false, true) => "Helvetica-Oblique",
+        (_, true, true) => "Helvetica-BoldOblique",
+    }
+    .to_owned()
+}
+
 fn encoding_to_unicode_table(name: &[u8]) -> Vec<u16> {
     let encoding = match &name[..] {
         b"MacRomanEncoding" => encodings::MAC_ROMAN_ENCODING,
@@ -587,28 +641,15 @@ impl<'a> PdfSimpleFont<'a> {
             assert_eq!(first_char + i - 1, last_char);
         } else {
             let name = if is_core_font(&base_name) {
-                &base_name
+                base_name.clone()
             } else {
                 warn!("no widths and not core font {:?}", base_name);
-
-                // This situation is handled differently by different readers
-                // but basically we try to substitute the best font that we can.
-
-                // Poppler/Xpdf:
-                // this is technically an error -- the Widths entry is required
-                // for all but the Base-14 fonts -- but certain PDF generators
-                // apparently don't include widths for Arial and TimesNewRoman
-
-                // Pdfium: CFX_FontMapper::FindSubstFont
-
-                // mupdf: pdf_load_substitute_font
-
-                // We can try to do a better job guessing at a font by looking at the flags
-                // or the basename but for now we'll just use Helvetica
-                "Helvetica"
+                // Like pdfium/poppler/pdf.js: substitute the standard-14 metrics of the
+                // matching family (Arial -> Helvetica, TimesNewRoman -> Times, ...).
+                standard_font_substitute(&base_name, get(doc, font, b"FontDescriptor"))
             };
             for font_metrics in core_fonts::metrics().iter() {
-                if font_metrics.0 == base_name {
+                if font_metrics.0 == name {
                     if let Some(ref encoding) = encoding_table {
                         dlog!("has encoding");
                         for w in font_metrics.2 {
@@ -629,7 +670,7 @@ impl<'a> PdfSimpleFont<'a> {
                             dlog!("{} {}", w.0, w.2);
                             // -1 is "not encoded"
                             if w.0 != -1 {
-                                table[w.0 as usize] = if base_name == "ZapfDingbats" {
+                                table[w.0 as usize] = if name == "ZapfDingbats" {
                                     zapfglyphnames::zapfdigbats_names_to_unicode(w.2).unwrap_or_else(|| panic!("bad name {:?}", w))
                                 } else {
                                     glyphnames::name_to_unicode(w.2).unwrap()
@@ -5443,6 +5484,113 @@ mod cid_width_tests {
         let f = PdfCIDFont::new(&doc, &font);
         assert_eq!(f.widths.len(), 0x10000);
         assert_eq!(f.get_width(0xFFFF), 600.);
+    }
+}
+
+#[cfg(test)]
+mod standard_font_substitution_tests {
+    use super::*;
+    use lopdf::dictionary;
+
+    fn width_of(font: &Dictionary, c: u8) -> f64 {
+        let doc = Document::with_version("1.5");
+        PdfSimpleFont::new(&doc, font).get_width(c as CharCode)
+    }
+
+    fn truetype(base: &str) -> Dictionary {
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => base,
+            "Encoding" => "WinAnsiEncoding",
+        }
+    }
+
+    #[test]
+    fn arialmt_without_widths_gets_helvetica_widths() {
+        let f = truetype("ArialMT");
+        assert_eq!(width_of(&f, b'J'), 500.);
+        assert_eq!(width_of(&f, b'e'), 556.);
+        assert_eq!(width_of(&f, b' '), 278.);
+    }
+
+    #[test]
+    fn type1_arialmt_without_encoding_gets_helvetica_widths() {
+        let f = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "ArialMT" };
+        assert_eq!(width_of(&f, b'J'), 500.);
+        assert_eq!(width_of(&f, b' '), 278.);
+    }
+
+    #[test]
+    fn subset_prefixed_bold_name_gets_helvetica_bold() {
+        // Helvetica-Bold: J is 556 (Helvetica: 500), space 278.
+        assert_eq!(width_of(&truetype("ABCDEF+Arial-BoldMT"), b'J'), 556.);
+        assert_eq!(width_of(&truetype("Arial,Bold"), b'J'), 556.);
+        // Helvetica-Bold 'a' is 556, Helvetica 'a' is 556, so use 'i': 278 vs 222.
+        assert_eq!(width_of(&truetype("ABCDEF+Arial-BoldMT"), b'i'), 278.);
+        assert_eq!(width_of(&truetype("ArialMT"), b'i'), 222.);
+    }
+
+    #[test]
+    fn timesnewromanpsmt_gets_times_roman() {
+        let f = truetype("TimesNewRomanPSMT");
+        assert_eq!(width_of(&f, b'J'), 389.);
+        assert_eq!(width_of(&f, b'e'), 444.);
+        assert_eq!(width_of(&f, b' '), 250.);
+        // Bold/italic variants.
+        assert_eq!(width_of(&truetype("TimesNewRomanPS-BoldMT"), b'i'), 278.);
+        assert_eq!(width_of(&truetype("TimesNewRomanPS-ItalicMT"), b'i'), 278.);
+        assert_eq!(width_of(&truetype("TimesNewRomanPS-BoldMT"), b'J'), 500.);
+        assert_eq!(width_of(&truetype("TimesNewRomanPS-ItalicMT"), b'J'), 444.);
+    }
+
+    #[test]
+    fn couriernewpsmt_gets_courier() {
+        assert_eq!(width_of(&truetype("CourierNewPSMT"), b'J'), 600.);
+        assert_eq!(width_of(&truetype("CourierNewPSMT"), b' '), 600.);
+    }
+
+    #[test]
+    fn helvetica_narrow_maps_to_helvetica() {
+        assert_eq!(width_of(&truetype("Helvetica-Narrow"), b'J'), 500.);
+    }
+
+    #[test]
+    fn unknown_name_falls_back_to_descriptor_flags() {
+        let with_flags = |flags: i64| {
+            let mut f = truetype("MysteryFace");
+            f.set("FontDescriptor", dictionary! { "Type" => "FontDescriptor", "Flags" => flags });
+            f
+        };
+        assert_eq!(width_of(&with_flags(1), b'J'), 600.); // FixedPitch -> Courier
+        assert_eq!(width_of(&with_flags(2), b'J'), 389.); // Serif -> Times-Roman
+        assert_eq!(width_of(&with_flags(2 | 262144), b'J'), 500.); // + ForceBold -> Times-Bold
+        assert_eq!(width_of(&with_flags(0), b'J'), 500.); // sans -> Helvetica
+        assert_eq!(width_of(&with_flags(262144), b'J'), 556.); // sans bold -> Helvetica-Bold
+        assert_eq!(width_of(&truetype("MysteryFace"), b'J'), 500.); // no descriptor -> Helvetica
+    }
+
+    #[test]
+    fn symbol_family_names_keep_symbol_metrics() {
+        let f = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "SymbolMT" };
+        assert_eq!(width_of(&f, b'a'), 631.); // alpha
+        // Even under a WinAnsi encoding the lookup must not panic on Symbol glyph names.
+        let _ = width_of(&truetype("SymbolMT"), b'a');
+    }
+
+    #[test]
+    fn font_with_widths_keeps_them() {
+        let mut f = truetype("ArialMT");
+        f.set("FirstChar", 74);
+        f.set("LastChar", 74);
+        f.set("Widths", vec![Object::Integer(777)]);
+        assert_eq!(width_of(&f, b'J'), 777.);
+    }
+
+    #[test]
+    fn real_standard_font_is_unchanged() {
+        let f = dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Times-Roman" };
+        assert_eq!(width_of(&f, b'J'), 389.);
     }
 }
 
